@@ -57,9 +57,11 @@ No-repo options are in [Other ways to install](#other-ways-to-install).
   - A **red ● recording control** lets you Stop/Cancel; for full-screen the Stop
     button moves to the panel (a red ⏹) so nothing of CosmicShot is in the
     recording. You can also stop from a hotkey bound to `cosmicshot record --stop`.
-  - After recording, a **preview player** with a scrubbable timeline (playhead,
-    elapsed / total, `Space` to play-pause) lets you watch it, then **Save As…**
-    (remembers the last folder) or **Discard**.
+  - After recording, a **preview player** with a scrubbable timeline — draggable
+    playhead, elapsed / total, restart, `Space` to play-pause, and frame-accurate
+    seeking so you can land on the exact frame you want. It holds on the last
+    frame rather than looping. Then **Save As…** (remembers the last folder) or
+    **Discard**.
 - **Instant annotation editor** with tools:
   - **Direct manipulation with any tool** — hover a shape (it highlights), drag
     its body to move or a handle to resize; arrows/lines have endpoint handles,
@@ -158,9 +160,10 @@ cosmicshot tray                      # run the panel tray icon
 
 The installer starts the tray automatically at login. It adds an icon to the
 COSMIC panel with a capture/record menu, plus **Settings…**. While a full-screen
-recording is running the icon turns into a red ⏹ **Stop recording** button. Quit
-is guarded while recording: it asks first and always stops the recording, so one
-can never be orphaned in the background.
+recording is running the icon turns into a red ⏹ **Stop recording** button, and
+that is the only thing the menu offers — **Quit is hidden while recording**, since
+picking it by mistake used to kill the panel while the recording carried on in the
+background with no way to stop it. Quit comes back the moment the recording ends.
 
 > Needs `gir1.2-ayatanaappindicator3-0.1` (present on most COSMIC installs; the
 > `.deb` recommends it).
