@@ -1,5 +1,6 @@
 """The annotation editor window -- the heart of the CleanShot-style experience."""
 import copy
+import math
 
 import gi
 gi.require_version("Gtk", "3.0")
@@ -27,6 +28,16 @@ TOOLS = [
 
 ACCENT = (0.0, 0.48, 1.0)
 _BOX_HANDLES = ["nw", "n", "ne", "e", "se", "s", "sw", "w"]
+
+# Crop aspect ratios offered in the toolbar, as (label, width / height).
+# Both orientations are listed so a ratio always means exactly what it says —
+# picking "16:9" never silently gives you 9:16 because you dragged tall.
+CROP_RATIOS = [
+    ("Free", None), ("1:1", 1.0),
+    ("4:3", 4 / 3), ("3:4", 3 / 4),
+    ("3:2", 3 / 2), ("2:3", 2 / 3),
+    ("16:9", 16 / 9), ("9:16", 9 / 16),
+]
 
 # --- editor theme (scoped via .cs-* classes so it only touches our UI, and
 #     built from a light/dark palette so it follows COSMIC) ---
@@ -162,12 +173,28 @@ class Editor(Gtk.Window):
         self.editing_text = None   # Text annotation being typed in-place
         self._caret_on = True
         self._caret_src = None
+        self._caret = 0            # caret position (character index) while editing
+        self._sel = None           # selection anchor (character index) or None
+        self._text_drag = False    # dragging inside a text box to select a range
         self._edit_snapshot = None     # state captured when text editing began
         self._edit_undo_pushed = False
         self._maybe_edit = None        # text under a press, to edit on click-no-drag
+        self._maybe_edit_pt = None     # where that press landed (to seat the caret)
         self._press_moved = False
         self.text_align = "left"
         self.pending_pin = None
+
+        # Shift-constrained angles for lines/arrows, and straight highlighter
+        # strokes. Both default ON; the toolbar checkboxes hold the setting and
+        # Shift always inverts whatever is set.
+        self.snap_angles = bool(self.cfg.get("angle_snap_lock", True))
+        self.highlight_straight = bool(self.cfg.get("highlight_straight", True))
+        self.circle_lock = bool(self.cfg.get("ellipse_circle_lock", False))
+        self.crop_ratio = dict(CROP_RATIOS).get(self.cfg.get("crop_ratio", "Free"))
+
+        # In-editor clipboard for annotation elements (Ctrl+C / Ctrl+X / Ctrl+V).
+        self._ann_clip = None
+        self._paste_n = 0
 
         # Select-tool state
         self.selected = None
@@ -231,7 +258,8 @@ class Editor(Gtk.Window):
 
         copy_b = Gtk.Button(label="Copy")
         copy_b.get_style_context().add_class("suggested-action")
-        copy_b.set_tooltip_text("Copy to clipboard (Ctrl+C)")
+        copy_b.set_tooltip_text("Copy the image to the clipboard and close\n"
+                                "(Ctrl+C copies the selected element instead)")
         copy_b.connect("clicked", lambda *_: self.do_copy())
         save_b = Gtk.Button(label="Save")
         save_b.set_tooltip_text("Save PNG (Ctrl+S)")
@@ -290,6 +318,60 @@ class Editor(Gtk.Window):
         self.width_spin.connect("value-changed", self._on_width_changed)
         self.thick_ctl.pack_start(self.width_spin, False, False, 0)
         toolbar.pack_start(self.thick_ctl, False, False, 0)
+
+        # angle snapping for lines / arrows (checkbox locks it on)
+        self.snap_ctl = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        self.snap_check = Gtk.CheckButton(label=f"Snap {self.SNAP_DEG}°")
+        self.snap_check.set_active(self.snap_angles)
+        self.snap_check.set_tooltip_text(
+            f"Lock lines and arrows to {self.SNAP_DEG}° steps.\n"
+            "Off: hold Shift to snap.  On: hold Shift for a free angle.")
+        self.snap_check.connect("toggled", self._on_snap_toggled)
+        self.snap_ctl.pack_start(self.snap_check, False, False, 0)
+        toolbar.pack_start(self.snap_ctl, False, False, 0)
+        self._hand_on_hover(self.snap_check)
+
+        # straight vs freehand highlighter strokes
+        self.hl_ctl = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        self.straight_check = Gtk.CheckButton(label="Straight")
+        self.straight_check.set_active(self.highlight_straight)
+        self.straight_check.set_tooltip_text(
+            "Lay the highlighter down as one straight stroke, snapped to "
+            f"{self.SNAP_DEG}° steps — so it follows a line of text exactly.\n"
+            "Off: the stroke follows your hand.  Hold Shift to invert.")
+        self.straight_check.connect("toggled", self._on_straight_toggled)
+        self.hl_ctl.pack_start(self.straight_check, False, False, 0)
+        toolbar.pack_start(self.hl_ctl, False, False, 0)
+        self._hand_on_hover(self.straight_check)
+
+        # perfect circle vs free ellipse
+        self.circle_ctl = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        self.circle_check = Gtk.CheckButton(label="Circle")
+        self.circle_check.set_active(self.circle_lock)
+        self.circle_check.set_tooltip_text(
+            "Force a perfect circle instead of a free ellipse — while drawing "
+            "and while resizing.\nOff: free ellipse.  Hold Shift to invert.")
+        self.circle_check.connect("toggled", self._on_circle_toggled)
+        self.circle_ctl.pack_start(self.circle_check, False, False, 0)
+        toolbar.pack_start(self.circle_ctl, False, False, 0)
+        self._hand_on_hover(self.circle_check)
+
+        # strict crop aspect ratio (or Free)
+        self.crop_ctl = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        self.crop_ctl.pack_start(Gtk.Label(label="Ratio"), False, False, 0)
+        self.ratio_combo = Gtk.ComboBoxText()
+        for label, _r in CROP_RATIOS:
+            self.ratio_combo.append_text(label)
+        cur = self.cfg.get("crop_ratio", "Free")
+        labels = [lbl for lbl, _r in CROP_RATIOS]
+        self.ratio_combo.set_active(labels.index(cur) if cur in labels else 0)
+        self.ratio_combo.set_tooltip_text(
+            "Hold the crop to a strict aspect ratio.\n"
+            "Shift frees a set ratio, or squares a free crop.")
+        self.ratio_combo.connect("changed", self._on_ratio_changed)
+        self.crop_ctl.pack_start(self.ratio_combo, False, False, 0)
+        toolbar.pack_start(self.crop_ctl, False, False, 0)
+        self._hand_on_hover(self.ratio_combo)
 
         # font family + size (only for the Text tool / selected text)
         self.font_ctl = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
@@ -436,18 +518,150 @@ class Editor(Gtk.Window):
             sel.width = self.width
             self.canvas.queue_draw()
 
+    # ------------------------------------------------------- angle snapping
+    SNAP_DEG = 15            # predefined angle step for lines / arrows
+
+    def _on_snap_toggled(self, btn):
+        self.snap_angles = btn.get_active()
+        self.cfg["angle_snap_lock"] = self.snap_angles
+        config.save(self.cfg)
+
+    def _on_straight_toggled(self, btn):
+        self.highlight_straight = btn.get_active()
+        self.cfg["highlight_straight"] = self.highlight_straight
+        config.save(self.cfg)
+
+    def _on_circle_toggled(self, btn):
+        self.circle_lock = btn.get_active()
+        self.cfg["ellipse_circle_lock"] = self.circle_lock
+        config.save(self.cfg)
+        # Ticking it with a circle-able shape selected reshapes it right away.
+        if isinstance(self.selected, tools.Ellipse) and self.circle_lock:
+            self._push_undo()
+            self.selected.set_bbox(*self._square_bbox(self.selected.bbox(), "se"))
+            self.canvas.queue_draw()
+
+    def _on_ratio_changed(self, combo):
+        label = combo.get_active_text() or "Free"
+        self.crop_ratio = dict(CROP_RATIOS).get(label)
+        self.cfg["crop_ratio"] = label
+        config.save(self.cfg)
+        # Re-fit a crop already on screen so the choice is visible immediately.
+        if self.crop_rect:
+            x, y, w, h = self.crop_rect
+            self.crop_rect = self._crop_from_drag(x, y, x + w, y + h, 0)
+            self.canvas.queue_draw()
+
+    @staticmethod
+    def _lock_active(locked, state):
+        """A toolbar lock checkbox sets the default behaviour; Shift always
+        inverts it, so either mode is one modifier away."""
+        shift = bool(state & Gdk.ModifierType.SHIFT_MASK)
+        return (not shift) if locked else shift
+
+    def _want_snap(self, state):
+        """Should this line/arrow drag snap to a fixed angle?"""
+        return self._lock_active(self.snap_angles, state)
+
+    def _want_straight(self, state):
+        """Should this highlighter stroke be a single straight segment?"""
+        return self._lock_active(self.highlight_straight, state)
+
+    def _want_circle(self, state):
+        """Should this ellipse be a perfect circle?"""
+        return self._lock_active(self.circle_lock, state)
+
+    def _square_bbox(self, bbox, handle):
+        """Make `bbox` square, holding the edge opposite the dragged handle so
+        the corner under the cursor is the one that moves."""
+        x, y, w, h = bbox
+        s = max(w, h)
+        if "w" in handle:          # dragging the left edge -> right edge stays put
+            x = x + w - s
+        if "n" in handle:          # dragging the top -> bottom stays put
+            y = y + h - s
+        return (x, y, s, s)
+
+    def _drag_bbox(self, x0, y0, ix, iy, square=False):
+        """The rect swept from the press point (x0, y0) to (ix, iy). When
+        `square`, the larger drag axis sets both sides, anchored at the press
+        point so the shape still grows the way the cursor is moving."""
+        w, h = abs(ix - x0), abs(iy - y0)
+        if square:
+            w = h = max(w, h)
+        x = x0 if ix >= x0 else x0 - w
+        y = y0 if iy >= y0 else y0 - h
+        return (x, y, w, h)
+
+    # ------------------------------------------------------------ crop ratio
+    def _crop_ratio_active(self, state):
+        """The ratio this crop drag should hold, or None for free. Shift frees a
+        set ratio and squares a free one (the usual crop convention)."""
+        if state & Gdk.ModifierType.SHIFT_MASK:
+            return None if self.crop_ratio else 1.0
+        return self.crop_ratio
+
+    def _crop_from_drag(self, x0, y0, ix, iy, state):
+        """Crop rect for a drag from (x0, y0) to (ix, iy), honouring the chosen
+        ratio and never straying outside the image — so what's outlined is
+        exactly what Apply will cut (a ratio survives the edges intact)."""
+        W, H = self.base_image.width, self.base_image.height
+        x0 = max(0.0, min(float(W), x0))
+        y0 = max(0.0, min(float(H), y0))
+        right, down = ix >= x0, iy >= y0
+        room_w = (W - x0) if right else x0      # space available from the anchor
+        room_h = (H - y0) if down else y0
+        w, h = abs(ix - x0), abs(iy - y0)
+        ratio = self._crop_ratio_active(state)
+        if ratio:
+            if w >= h * ratio:                  # grow to cover the drag...
+                h = w / ratio
+            else:
+                w = h * ratio
+            k = min(1.0,                        # ...then shrink to fit, ratio intact
+                    room_w / w if w else 1.0,
+                    room_h / h if h else 1.0)
+            w, h = w * k, h * k
+        else:
+            w, h = min(w, room_w), min(h, room_h)
+        x = x0 if right else x0 - w
+        y = y0 if down else y0 - h
+        return (x, y, w, h)
+
+    def _snap_point(self, x0, y0, x, y):
+        """Pull (x, y) onto the nearest SNAP_DEG ray from (x0, y0), keeping the
+        distance — so 0/15/…/90° lines and arrows come out exact."""
+        dx, dy = x - x0, y - y0
+        dist = math.hypot(dx, dy)
+        if dist < 1e-6:
+            return x, y
+        step = math.radians(self.SNAP_DEG)
+        ang = round(math.atan2(dy, dx) / step) * step
+        return x0 + math.cos(ang) * dist, y0 + math.sin(ang) * dist
+
     def _update_tool_controls(self):
         """Show the style control relevant to the active tool / selection
-        (thickness / font+align / blur / darkness)."""
-        if getattr(self, "thick_ctl", None) is None:
+        (thickness / snapping / font+align / blur / darkness)."""
+        # Called while the toolbar is still being built (the first tool radio
+        # button emits "toggled" on creation), so bail out until it's all there.
+        if any(getattr(self, n, None) is None
+               for n in ("thick_ctl", "snap_ctl", "hl_ctl", "circle_ctl",
+                         "crop_ctl", "font_ctl", "blur_ctl", "dark_ctl")):
             return
         t = self.tool
         text_ctx = (t == "text" or self.editing_text is not None
                     or isinstance(self.selected, tools.Text))
         spot_ctx = (t == "spotlight" or isinstance(self.selected, tools.Spotlight))
+        # Arrow covers Line (it subclasses it), so both share the snap control.
+        line_ctx = (t in ("arrow", "line") or isinstance(self.selected, tools.Arrow))
         self.font_ctl.set_visible(text_ctx)
         self.blur_ctl.set_visible(t == "blur")
         self.dark_ctl.set_visible(spot_ctx)
+        self.snap_ctl.set_visible(line_ctx and not text_ctx)
+        self.hl_ctl.set_visible(t == "highlight")
+        self.circle_ctl.set_visible(t == "ellipse"
+                                    or isinstance(self.selected, tools.Ellipse))
+        self.crop_ctl.set_visible(t == "crop")
         self.thick_ctl.set_visible(
             not text_ctx and not spot_ctx and t != "blur")
 
@@ -724,8 +938,22 @@ class Editor(Gtk.Window):
         self.hover_ann = None
         t = self.tool
 
+        # Double / triple click inside the text being edited: select a word, then
+        # everything (the plain press below has already seated the caret).
+        if self.editing_text is not None and ev.type in (
+                Gdk.EventType._2BUTTON_PRESS, Gdk.EventType._3BUTTON_PRESS):
+            self._text_drag = False
+            if ev.type == Gdk.EventType._3BUTTON_PRESS:
+                self._sel, self._caret = 0, len(self.editing_text.text or "")
+            else:
+                self._select_word_at(self.editing_text.index_at(ix, iy))
+            self._restart_caret()
+            self.canvas.queue_draw()
+            return True
+
         # While editing text: grab a handle to resize it (keep editing); a press
-        # anywhere else finalises the text, then proceeds normally.
+        # inside the box moves the caret / starts a selection drag; a press
+        # anywhere else finalises the text.
         if self.editing_text is not None:
             h = self._hit_handle(self.editing_text, ev.x, ev.y)
             if h:
@@ -733,6 +961,12 @@ class Editor(Gtk.Window):
                 self._moving = False
                 self._predrag = self._snapshot()
                 self._drag_committed = False
+                return True
+            bx, by, bw, bh = self.editing_text.bbox()
+            if bx <= ix <= bx + bw and by <= iy <= by + bh:
+                self._move_caret(self.editing_text.index_at(ix, iy),
+                                 bool(ev.state & Gdk.ModifierType.SHIFT_MASK))
+                self._text_drag = True
                 return True
             # A click outside the box just FINISHES editing — it does not also
             # place a new text box. The next click starts a fresh one.
@@ -772,6 +1006,7 @@ class Editor(Gtk.Window):
             # click on an already-selected text box (no drag) enters editing.
             self._maybe_edit = (ann if isinstance(ann, tools.Text) and was_selected
                                 else None)
+            self._maybe_edit_pt = (ix, iy)
             self._press_moved = False
             self._update_tool_controls()
             self.canvas.queue_draw()
@@ -798,31 +1033,18 @@ class Editor(Gtk.Window):
         self.canvas.queue_draw()
         return True
 
-    # Highlighter assist: snap to a horizontal/vertical straight line unless the
-    # stroke wanders more than this far (image px) off that axis.
-    _HL_SNAP = 22
-
-    def _assist_highlight(self, raw):
-        if len(raw) < 2:
-            return list(raw)
-        x0, y0 = raw[0]
-        xe, ye = raw[-1]
-        horizontal = abs(xe - x0) >= abs(ye - y0)
-        if horizontal:
-            dev = max(abs(p[1] - y0) for p in raw)
-            if dev <= self._HL_SNAP:
-                return [(x0, y0), (xe, y0)]        # clean horizontal
-        else:
-            dev = max(abs(p[0] - x0) for p in raw)
-            if dev <= self._HL_SNAP:
-                return [(x0, y0), (x0, ye)]        # clean vertical
-        return list(raw)                            # forced off-axis -> freehand
-
     def on_canvas_motion(self, _w, ev):
         ix, iy = self.to_image(ev.x, ev.y)
+        # dragging inside a text box -> extend the text selection
+        if self._text_drag and self.editing_text is not None:
+            if self._sel is None:
+                self._sel = self._caret
+            self._caret = self.editing_text.index_at(ix, iy)
+            self.canvas.queue_draw()
+            return True
         # a grab (move/resize) is in progress?
         if self.active_handle or self._moving:
-            self._select_motion(ev.x, ev.y, ix, iy)
+            self._select_motion(ev.x, ev.y, ix, iy, ev.state)
             return True
         # not pressing -> just update hover cursor/highlight
         if self.press_img is None:
@@ -831,11 +1053,14 @@ class Editor(Gtk.Window):
         x0, y0 = self.press_img
         t = self.tool
         if t in ("arrow", "line"):
+            ex, ey = (self._snap_point(x0, y0, ix, iy)
+                      if self._want_snap(ev.state) else (ix, iy))
             cls = tools.Arrow if t == "arrow" else tools.Line
-            self.draft = cls(x0, y0, ix, iy, self.color, self.width)
+            self.draft = cls(x0, y0, ex, ey, self.color, self.width)
         elif t in ("rect", "ellipse", "blur", "spotlight"):
-            x, y = min(x0, ix), min(y0, iy)
-            w, h = abs(ix - x0), abs(iy - y0)
+            x, y, w, h = self._drag_bbox(
+                x0, y0, ix, iy,
+                square=(t == "ellipse" and self._want_circle(ev.state)))
             if t == "rect":
                 self.draft = tools.Rect(x, y, w, h, self.color, self.width)
             elif t == "ellipse":
@@ -847,32 +1072,48 @@ class Editor(Gtk.Window):
         elif t == "pen" and self.draft:
             self.draft.points.append((ix, iy))
         elif t == "highlight" and self.draft:
+            # Straight: one segment from the press point, angle-snapped (so a
+            # highlight lands exactly along a line of text). Free: follow the hand.
             self._hl_raw.append((ix, iy))
-            self.draft.points = self._assist_highlight(self._hl_raw)
+            if self._want_straight(ev.state):
+                self.draft.points = [(x0, y0), self._snap_point(x0, y0, ix, iy)]
+            else:
+                self.draft.points = list(self._hl_raw)
         elif t == "crop":
-            x, y = min(x0, ix), min(y0, iy)
-            self.crop_rect = (x, y, abs(ix - x0), abs(iy - y0))
+            self.crop_rect = self._crop_from_drag(x0, y0, ix, iy, ev.state)
         self.canvas.queue_draw()
         return True
 
     def on_canvas_release(self, _w, ev):
         if ev.button != 1:
             return False
+        if self._text_drag:
+            self._text_drag = False
+            self.press_img = None
+            self.canvas.queue_draw()
+            return True
         # finishing a grab (move/resize)?
         if self.active_handle or self._moving:
             was_move = self._moving
+            resized = self.active_handle is not None
             cand, moved = self._maybe_edit, self._press_moved
+            at = self._maybe_edit_pt
             self.active_handle = None
             self._moving = False
             self._drag_last = None
             self._predrag = None
             self.press_img = None
             self._maybe_edit = None
+            self._maybe_edit_pt = None
             self._press_moved = False
             self._set_canvas_cursor(self._tool_cursor())  # release closed hand
+            # A resize that collapsed the shape to nothing would leave an
+            # invisible but still clickable element behind — drop it instead.
+            if resized and moved:
+                self._drop_if_degenerate(self.selected)
             # a click (no drag) on a text box -> edit it
             if was_move and cand is not None and not moved:
-                self.edit_existing(cand)
+                self.edit_existing(cand, at)
             return True
         t = self.tool
         if t == "crop":
@@ -894,19 +1135,58 @@ class Editor(Gtk.Window):
         self.canvas.queue_draw()
         return True
 
+    # An annotation smaller than this (image px) draws nothing you can see, yet
+    # still owns a click/hover zone — so it's treated as never having existed.
+    MIN_EXTENT = 5
+
+    def _is_degenerate(self, ann):
+        """True when `ann` has no visible footprint: a stray click or a tiny
+        jitter-drag that would otherwise leave an invisible hit zone."""
+        if isinstance(ann, tools.Text):
+            return not (ann.text or "").strip()
+        if isinstance(ann, tools.Counter):
+            return ann.radius < 2
+        if isinstance(ann, tools.Pen):          # covers Highlight
+            if len(ann.points) < 2:
+                return True
+            _x, _y, w, h = ann.bbox()
+            return math.hypot(w, h) < 2
+        if isinstance(ann, tools.Arrow):        # covers Line
+            return math.hypot(ann.x1 - ann.x0, ann.y1 - ann.y0) < self.MIN_EXTENT
+        _x, _y, w, h = ann.bbox()
+        return w < self.MIN_EXTENT or h < self.MIN_EXTENT
+
     def _draft_is_meaningful(self):
-        d = self.draft
-        if isinstance(d, (tools.Pen, tools.Highlight)):
-            return len(d.points) >= 2
-        if isinstance(d, (tools.Rect, tools.Ellipse, tools.Blur, tools.Spotlight)):
-            return d.w > 3 and d.h > 3
-        if isinstance(d, (tools.Arrow, tools.Line)):
-            return abs(d.x1 - d.x0) + abs(d.y1 - d.y0) > 4
-        return True
+        return self.draft is not None and not self._is_degenerate(self.draft)
+
+    def _drop_if_degenerate(self, ann):
+        """Remove `ann` if it has collapsed to nothing (never for the text box
+        currently being typed into — that one is empty by definition at first)."""
+        if ann is None or ann is self.editing_text:
+            return False
+        if ann in self.annotations and self._is_degenerate(ann):
+            self.annotations.remove(ann)
+            if self.selected is ann:
+                self.selected = None
+                self._update_tool_controls()
+            self.canvas.queue_draw()
+            return True
+        return False
+
+    def _prune_degenerate(self):
+        """Sweep out any invisible leftovers before rendering/exporting."""
+        keep = [a for a in self.annotations if not self._is_degenerate(a)]
+        if len(keep) != len(self.annotations):
+            if self.selected not in keep:
+                self.selected = None
+            self.annotations = keep
 
     # ----------------------------------------------------------- select tool
     def _handle_points_widget(self, ann):
-        """name -> (wx, wy) handle positions in widget space."""
+        """name -> (wx, wy) handle positions in widget space. Empty for shapes
+        that aren't resizable (highlights) — nothing to draw, nothing to grab."""
+        if ann.handle_style == "none":
+            return {}
         if ann.handle_style == "endpoints":
             pts = ann.endpoints()
         else:
@@ -934,7 +1214,7 @@ class Editor(Gtk.Window):
                 return ann
         return None
 
-    def _select_motion(self, wx, wy, ix, iy):
+    def _select_motion(self, wx, wy, ix, iy, state=0):
         if not (self.active_handle or self._moving) or self.selected is None:
             self._update_hover_cursor(wx, wy)
             return
@@ -950,9 +1230,18 @@ class Editor(Gtk.Window):
         sel = self.selected
         if self.active_handle:
             if sel.handle_style == "endpoints":
+                # Re-aiming a line/arrow snaps to the same fixed angles as
+                # drawing one, pivoting around the endpoint that stays put.
+                if isinstance(sel, tools.Arrow) and self._want_snap(state):
+                    pts = sel.endpoints()
+                    ax, ay = pts["end" if self.active_handle == "start" else "start"]
+                    ix, iy = self._snap_point(ax, ay, ix, iy)
                 sel.set_endpoint(self.active_handle, ix, iy)
             else:
-                sel.set_bbox(*_resize_bbox(sel.bbox(), self.active_handle, ix, iy))
+                box = _resize_bbox(sel.bbox(), self.active_handle, ix, iy)
+                if isinstance(sel, tools.Ellipse) and self._want_circle(state):
+                    box = self._square_bbox(box, self.active_handle)
+                sel.set_bbox(*box)
         elif self._moving:
             if self.tool == "select":
                 self._set_canvas_cursor("grabbing")  # closed hand while dragging
@@ -993,13 +1282,55 @@ class Editor(Gtk.Window):
             self._push_undo()
             self.annotations.remove(self.selected)
             self.selected = None
-
-    def delete_selected(self):
-        if self.selected is not None and self.selected in self.annotations:
-            self._push_undo()
-            self.annotations.remove(self.selected)
-            self.selected = None
+            self._update_tool_controls()
             self.canvas.queue_draw()
+
+    # ---------------------------------------------- element copy / cut / paste
+    PASTE_OFFSET = 18        # image px each pasted copy is nudged by
+
+    def copy_element(self):
+        """Put the selected annotation on the editor's element clipboard."""
+        if self.selected is None:
+            return False
+        self._ann_clip = copy.deepcopy(self.selected)
+        self._paste_n = 0
+        return True
+
+    def cut_element(self):
+        if self.copy_element():
+            self.delete_selected()
+            return True
+        return False
+
+    def paste_element(self):
+        """Drop a copy of the clipboarded element, offset so it doesn't hide the
+        original. Repeated pastes cascade instead of stacking."""
+        if self._ann_clip is None:
+            return False
+        ann = copy.deepcopy(self._ann_clip)
+        self._push_undo()
+        if isinstance(ann, tools.Counter):
+            ann.number = self.counter_value      # a duplicated step gets the next number
+            self.counter_value += 1
+        self._paste_n += 1
+        off = self.PASTE_OFFSET * self._paste_n
+        ann.move(off, off)
+        self._keep_in_image(ann)
+        self.annotations.append(ann)
+        self.selected = ann
+        self._update_tool_controls()
+        self.canvas.queue_draw()
+        return True
+
+    def _keep_in_image(self, ann):
+        """Nudge a pasted element back if the offset pushed it off the image."""
+        x, y, w, h = ann.bbox()
+        W, H = self.base_image.width, self.base_image.height
+        dx = min(0.0, (W - 8) - x) if x > W - 8 else 0.0
+        dy = min(0.0, (H - 8) - y) if y > H - 8 else 0.0
+        if dx or dy:
+            ann.move(dx, dy)
+            self._paste_n = 0     # restart the cascade from the original spot
 
     # ------------------------------------------------------------------ text
     def start_text(self, wx, wy, ix, iy):
@@ -1013,6 +1344,8 @@ class Editor(Gtk.Window):
         ann.box_w = max(ann.min_width(), 320.0)
         self.editing_text = ann
         self.selected = ann
+        self._caret = 0
+        self._sel = None
         self._edit_snapshot = self._snapshot()
         self._edit_undo_pushed = False
         self._start_caret()
@@ -1020,13 +1353,17 @@ class Editor(Gtk.Window):
         self.canvas.grab_focus()
         self.canvas.queue_draw()
 
-    def edit_existing(self, ann):
-        """Re-enter editing on an already-committed Text annotation (on click)."""
+    def edit_existing(self, ann, at=None):
+        """Re-enter editing on an already-committed Text annotation (on click).
+        `at` is the image-space point clicked, so the caret lands where the user
+        actually pointed instead of at the end of the text."""
         self.commit_text()
         self.editing_text = ann   # stays in self.annotations
         self.selected = ann
         self.text_align = ann.align
         self._sync_align_buttons(ann.align)
+        self._caret = (ann.index_at(*at) if at else len(ann.text or ""))
+        self._sel = None
         self._edit_snapshot = self._snapshot()
         self._edit_undo_pushed = False
         self._start_caret()
@@ -1048,6 +1385,9 @@ class Editor(Gtk.Window):
         if ann is None:
             return
         self.editing_text = None
+        self._text_drag = False
+        self._caret = 0
+        self._sel = None
         self._stop_caret()
         is_new = ann not in self.annotations
         if ann.text.strip():
@@ -1084,45 +1424,217 @@ class Editor(Gtk.Window):
         if btn is not None and not btn.get_active():
             btn.set_active(True)
 
-    def _text_key(self, ev):
-        """Handle a key while editing text. Returns True (always consumed)."""
-        ann = self.editing_text
-        k = ev.keyval
-        ctrl = ev.state & Gdk.ModifierType.CONTROL_MASK
-        shift = ev.state & Gdk.ModifierType.SHIFT_MASK
-        if k == Gdk.KEY_Escape:
-            self.commit_text()
-        elif k in (Gdk.KEY_Return, Gdk.KEY_KP_Enter):
-            if shift:
-                self._ensure_edit_undo()
-                ann.text += "\n"; self.canvas.queue_draw()
-            else:
-                self.commit_text()
-        elif k == Gdk.KEY_BackSpace:
-            if ann.text:
-                self._ensure_edit_undo()
-                ann.text = ann.text[:-1]; self.canvas.queue_draw()
-        elif ctrl and k in (Gdk.KEY_v, Gdk.KEY_V):
-            self._paste_into_text()
+    # ------------------------------------------------- caret & selection model
+    def _has_selection(self):
+        return self._sel is not None and self._sel != self._caret
+
+    def _sel_range(self):
+        """The selected character range as (start, end); empty when start==end."""
+        if not self._has_selection():
+            return (self._caret, self._caret)
+        return (min(self._sel, self._caret), max(self._sel, self._caret))
+
+    def _move_caret(self, idx, extend=False):
+        n = len(self.editing_text.text or "")
+        if extend:
+            if self._sel is None:
+                self._sel = self._caret
         else:
-            ch = Gdk.keyval_to_unicode(k)
-            if ch >= 32:
-                self._ensure_edit_undo()
-                ann.text += chr(ch); self.canvas.queue_draw()
+            self._sel = None
+        self._caret = max(0, min(n, idx))
+        self._restart_caret()          # stay solid while navigating
+        self.canvas.queue_draw()
+
+    def _select_word_at(self, idx):
+        t = self.editing_text.text or ""
+        a = b = max(0, min(len(t), idx))
+        while a > 0 and not t[a - 1].isspace():
+            a -= 1
+        while b < len(t) and not t[b].isspace():
+            b += 1
+        self._sel, self._caret = a, b
+
+    def _insert_text(self, s):
+        """Insert `s` at the caret, replacing any selection."""
+        ann = self.editing_text
+        self._ensure_edit_undo()
+        a, b = self._sel_range()
+        t = ann.text or ""
+        ann.text = t[:a] + s + t[b:]
+        self._caret, self._sel = a + len(s), None
+        self._restart_caret()
+        self.canvas.queue_draw()
+
+    def _delete_text_selection(self):
+        if not self._has_selection():
+            return False
+        ann = self.editing_text
+        self._ensure_edit_undo()
+        a, b = self._sel_range()
+        t = ann.text or ""
+        ann.text = t[:a] + t[b:]
+        self._caret, self._sel = a, None
+        self._restart_caret()
+        self.canvas.queue_draw()
         return True
 
-    def _paste_into_text(self):
+    def _copy_text_selection(self):
+        a, b = self._sel_range()
+        if a == b:
+            return False
+        export.copy_text_to_clipboard((self.editing_text.text or "")[a:b])
+        return True
+
+    @staticmethod
+    def _word_left(text, i):
+        while i > 0 and text[i - 1].isspace():
+            i -= 1
+        while i > 0 and not text[i - 1].isspace():
+            i -= 1
+        return i
+
+    @staticmethod
+    def _word_right(text, i):
+        n = len(text)
+        while i < n and not text[i].isspace():
+            i += 1
+        while i < n and text[i].isspace():
+            i += 1
+        return i
+
+    def _caret_line_step(self, direction):
+        """Caret index one visual line up (-1) or down (+1), holding the column.
+        Uses the Pango layout, so it follows wrapping and alignment."""
+        from gi.repository import Pango
+        ann = self.editing_text
+        n = len(ann.text or "")
+        try:
+            layout = ann.layout()
+            pos = layout.index_to_pos(ann.index_to_byte(self._caret))
+            height = pos.height or int(ann.size * Pango.SCALE)
+            y = pos.y + height // 2 + direction * height
+            if y < 0:
+                return 0
+            if y > layout.get_extents()[1].height:
+                return n
+            _inside, bidx, trailing = layout.xy_to_index(pos.x, y)
+            return max(0, min(n, ann.byte_to_index(bidx) + (trailing or 0)))
+        except Exception:
+            return self._caret
+
+    def _line_edge(self, direction):
+        """Caret index at the start (-1) or end (+1) of the current visual line."""
+        ann = self.editing_text
+        try:
+            _no, line = ann.line_of(self._caret)
+            b = line.start_index if direction < 0 else line.start_index + line.length
+            return ann.byte_to_index(b)
+        except Exception:
+            return 0 if direction < 0 else len(ann.text or "")
+
+    def _text_key(self, ev):
+        """Handle a key while editing text. Returns True (always consumed) so no
+        editor shortcut can fire mid-sentence."""
+        ann = self.editing_text
+        k = ev.keyval
+        ctrl = bool(ev.state & Gdk.ModifierType.CONTROL_MASK)
+        shift = bool(ev.state & Gdk.ModifierType.SHIFT_MASK)
+        text = ann.text or ""
+        n = len(text)
+
+        # --- clipboard / select all ---
+        if ctrl and k in (Gdk.KEY_a, Gdk.KEY_A):
+            self._sel, self._caret = 0, n
+            self._restart_caret(); self.canvas.queue_draw(); return True
+        if ctrl and k in (Gdk.KEY_c, Gdk.KEY_C):
+            self._copy_text_selection(); return True
+        if ctrl and k in (Gdk.KEY_x, Gdk.KEY_X):
+            if self._copy_text_selection():
+                self._delete_text_selection()
+            return True
+        if ctrl and k in (Gdk.KEY_v, Gdk.KEY_V):
+            self._paste_into_text(); return True
+        if ctrl and k in (Gdk.KEY_z, Gdk.KEY_Z):
+            # Undo works on whole edits: finish this one first, then step back.
+            self.commit_text()
+            self.redo() if shift else self.undo()
+            return True
+
+        # --- navigation (Shift extends the selection) ---
+        nav = None
+        if k in (Gdk.KEY_Left, Gdk.KEY_KP_Left):
+            nav = self._word_left(text, self._caret) if ctrl else self._caret - 1
+        elif k in (Gdk.KEY_Right, Gdk.KEY_KP_Right):
+            nav = self._word_right(text, self._caret) if ctrl else self._caret + 1
+        elif k in (Gdk.KEY_Up, Gdk.KEY_KP_Up):
+            nav = self._caret_line_step(-1)
+        elif k in (Gdk.KEY_Down, Gdk.KEY_KP_Down):
+            nav = self._caret_line_step(+1)
+        elif k in (Gdk.KEY_Home, Gdk.KEY_KP_Home):
+            nav = 0 if ctrl else self._line_edge(-1)
+        elif k in (Gdk.KEY_End, Gdk.KEY_KP_End):
+            nav = n if ctrl else self._line_edge(+1)
+        if nav is not None:
+            # A plain arrow with an active selection collapses it to that side.
+            if not shift and self._has_selection() and not ctrl:
+                a, b = self._sel_range()
+                if k in (Gdk.KEY_Left, Gdk.KEY_KP_Left):
+                    nav = a
+                elif k in (Gdk.KEY_Right, Gdk.KEY_KP_Right):
+                    nav = b
+            self._move_caret(nav, shift)
+            return True
+
+        # --- editing ---
+        if k == Gdk.KEY_Escape:
+            self.commit_text(); return True
+        if k in (Gdk.KEY_Return, Gdk.KEY_KP_Enter):
+            if shift:
+                self._insert_text("\n")
+            else:
+                self.commit_text()
+            return True
+        if k == Gdk.KEY_BackSpace:
+            if not self._delete_text_selection() and self._caret > 0:
+                self._ensure_edit_undo()
+                ann.text = text[:self._caret - 1] + text[self._caret:]
+                self._caret -= 1
+                self._restart_caret()
+                self.canvas.queue_draw()
+            return True
+        if k in (Gdk.KEY_Delete, Gdk.KEY_KP_Delete):
+            if not self._delete_text_selection() and self._caret < n:
+                self._ensure_edit_undo()
+                ann.text = text[:self._caret] + text[self._caret + 1:]
+                self._restart_caret()
+                self.canvas.queue_draw()
+            return True
+        if ctrl:
+            return True      # swallow every other Ctrl combo while typing
+        ch = Gdk.keyval_to_unicode(k)
+        if ch >= 32:
+            self._insert_text(chr(ch))
+        return True
+
+    def _clipboard_text(self):
         import subprocess
         try:
             out = subprocess.run(["wl-paste", "-n", "-t", "text/plain"],
                                  capture_output=True, timeout=3)
             text = out.stdout.decode("utf-8", "replace")
+            if text:
+                return text
         except Exception:
-            text = ""
+            pass
+        try:
+            return Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD).wait_for_text() or ""
+        except Exception:
+            return ""
+
+    def _paste_into_text(self):
+        text = self._clipboard_text()
         if text:
-            self._ensure_edit_undo()
-            self.editing_text.text += text
-            self.canvas.queue_draw()
+            self._insert_text(text)
 
     # caret blink ---------------------------------------------------------
     def _start_caret(self):
@@ -1134,6 +1646,14 @@ class Editor(Gtk.Window):
         if self._caret_src is not None:
             GLib.source_remove(self._caret_src)
             self._caret_src = None
+
+    def _restart_caret(self):
+        """Show the caret solid and restart the blink — it must be visible while
+        typing or moving, not off on the wrong half of a blink."""
+        self._caret_on = True
+        if self._caret_src is not None:
+            GLib.source_remove(self._caret_src)
+            self._caret_src = GLib.timeout_add(500, self._blink_caret)
 
     def _blink_caret(self):
         self._caret_on = not self._caret_on
@@ -1216,6 +1736,7 @@ class Editor(Gtk.Window):
             cr.rectangle(bx, by, bw, bh)
             cr.fill()
             cr.restore()
+            self._draw_text_selection(cr)
             cr.save(); self.editing_text.draw(cr, ctx); cr.restore()
             self._draw_caret(cr)
         cr.restore()
@@ -1235,19 +1756,28 @@ class Editor(Gtk.Window):
             self._draw_box_frame(cr, self.selected, dashed=True)
         return False
 
+    def _draw_text_selection(self, cr):
+        """Tint the selected characters, under the glyphs."""
+        a, b = self._sel_range()
+        if a == b:
+            return
+        rects = self.editing_text.selection_rects(a, b, cr)
+        if not rects:
+            return
+        cr.save()
+        cr.set_source_rgba(*ACCENT, 0.35)
+        for rx, ry, rw, rh in rects:
+            cr.rectangle(rx, ry, max(1.5, rw), rh)
+        cr.fill()
+        cr.restore()
+
     def _draw_caret(self, cr):
-        """Draw the blinking text caret at the end of the text (Pango-aware, so it
-        follows wrapping and alignment). Hidden while dragging (move/resize)."""
+        """Draw the blinking text caret at its current position (Pango-aware, so
+        it follows wrapping and alignment). Hidden while dragging (move/resize)."""
         if not self._caret_on or self.active_handle or self._moving:
             return
-        from gi.repository import Pango
         ann = self.editing_text
-        layout = ann.build_layout(cr)
-        idx = len((ann.text or "").encode("utf-8"))
-        pos = layout.index_to_pos(idx)
-        cx = ann.x + ann.PAD + pos.x / Pango.SCALE
-        cy = ann.y + ann.PAD + pos.y / Pango.SCALE
-        ch = (pos.height / Pango.SCALE) or ann.size
+        cx, cy, ch = ann.caret_rect(self._caret, cr)
         cr.set_source_rgba(*config.hex_to_rgba(ann.color))
         cr.set_line_width(max(1.5, ann.size * 0.06))
         cr.move_to(cx, cy)
@@ -1313,13 +1843,16 @@ class Editor(Gtk.Window):
         ctrl = ev.state & Gdk.ModifierType.CONTROL_MASK
         shift = ev.state & Gdk.ModifierType.SHIFT_MASK
         k = ev.keyval
+        # Escape backs out of the current step only — it never leaves the editor.
+        # Copy / Save / Upload (or the window close button) are the only exits,
+        # so a stray Escape can't throw away a screenshot.
         if k == Gdk.KEY_Escape:
             if self.crop_rect:
                 self.cancel_crop()
             elif self.selected is not None:
-                self.selected = None; self.canvas.queue_draw()
-            else:
-                self._request_close()
+                self.selected = None
+                self._update_tool_controls()
+                self.canvas.queue_draw()
             return True
         if k in (Gdk.KEY_Return, Gdk.KEY_KP_Enter) and self.crop_rect:
             self.apply_crop(); return True
@@ -1336,8 +1869,15 @@ class Editor(Gtk.Window):
             self.redo() if shift else self.undo(); return True
         if ctrl and k in (Gdk.KEY_y, Gdk.KEY_Y):
             self.redo(); return True
+        # Ctrl+C/X/V act on the SELECTED ELEMENT, like any other canvas editor.
+        # Copying the finished image to the clipboard is the Copy button's job —
+        # it also closes the window, which is too destructive for a stray Ctrl+C.
         if ctrl and k in (Gdk.KEY_c, Gdk.KEY_C):
-            self.do_copy(); return True
+            self.copy_element(); return True
+        if ctrl and k in (Gdk.KEY_x, Gdk.KEY_X):
+            self.cut_element(); return True
+        if ctrl and k in (Gdk.KEY_v, Gdk.KEY_V):
+            self.paste_element(); return True
         if ctrl and k in (Gdk.KEY_s, Gdk.KEY_S):
             self.do_save(); return True
         if ctrl and k in (Gdk.KEY_u, Gdk.KEY_U):
@@ -1359,12 +1899,6 @@ class Editor(Gtk.Window):
             return False
         self._confirm_close()
         return True
-
-    def _request_close(self):
-        if self.dirty and not self._closing:
-            self._confirm_close()
-        else:
-            self.destroy()
 
     def _confirm_close(self):
         self.commit_text()
@@ -1389,6 +1923,7 @@ class Editor(Gtk.Window):
     # --------------------------------------------------------------- actions
     def _render(self):
         self.commit_text()
+        self._prune_degenerate()
         return export.render(self.base_surface, self.blur_surface, self.annotations)
 
     def do_copy(self):

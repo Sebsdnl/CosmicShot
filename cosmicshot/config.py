@@ -10,7 +10,7 @@ CONFIG_FILE = CONFIG_DIR / "config.json"
 # COSMIC dock can match windows to the installed .desktop entry and icon.
 APP_ID = "cosmicshot"
 APP_NAME = "CosmicShot"
-VERSION = "1.3.3"                       # single source of truth; matches the git tag
+VERSION = "1.4.0"                       # single source of truth; matches the git tag
 GITHUB_REPO = "davidboulay/CosmicShot"  # for the update check
 ICON_FILE = str(Path(__file__).resolve().parent / "cosmicshot.png")  # bundled fallback
 # Red ⏹ stop button shown in the panel while a recording is in progress.
@@ -62,6 +62,20 @@ DEFAULTS = {
     "export_bg": "#00000000",  # transparent padding background
     # Spotlight (focus) tool: how dark the surrounding area is (0..0.95).
     "spotlight_darkness": 0.6,
+    # Lines/arrows: lock drawing to 15° steps. On by default — clean angles are
+    # what you want almost always; hold Shift for a free angle. Editor toolbar.
+    "angle_snap_lock": True,
+    # Highlighter: lay down one straight (angle-snapped) stroke rather than
+    # following the hand. On by default — highlights follow lines of text; hold
+    # Shift for a freehand stroke. Editor toolbar.
+    "highlight_straight": True,
+    # Ellipse: force a perfect circle. Off by default (free ellipse); hold Shift
+    # for a circle. Editor toolbar.
+    "ellipse_circle_lock": False,
+    # Crop: hold a strict aspect ratio. One of the labels in editor.CROP_RATIOS
+    # ("Free", "1:1", "4:3", "3:4", "3:2", "2:3", "16:9", "9:16"). "Free" by
+    # default; Shift frees a set ratio, or squares a free crop.
+    "crop_ratio": "Free",
     # Cloud upload. Default: catbox.moe — free, no account, PERMANENT links.
     # Public host (anyone with the URL can view) — redact sensitive bits first.
     # Configurable for other hosts, e.g. open-source uguu.se (links expire ~3h):

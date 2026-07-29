@@ -9,7 +9,8 @@ Annotations also expose a small geometry protocol used by the editor's Select to
   set_bbox(x,y,w,h)  -> reshape to a new bounding box (box-style shapes)
   move(dx, dy)       -> translate
   contains(px,py,t)  -> is the point within tolerance t of the shape?
-  handle_style       -> "box" (8 corner/edge handles) or "endpoints" (start/end)
+  handle_style       -> "box" (8 corner/edge handles), "endpoints" (start/end),
+                        or "none" (movable/deletable but never resized)
   endpoints()/set_endpoint(name, x, y)  -> for line/arrow style shapes
 """
 import math
@@ -34,6 +35,23 @@ _PANGO_ALIGN = {
 
 def _set_color(cr, hex_color, alpha=1.0):
     cr.set_source_rgba(*hex_to_rgba(hex_color, alpha))
+
+
+_MEASURE_CR = None
+
+
+def measure_cr():
+    """A throwaway cairo context used to build Pango layouts outside of a draw
+    (caret placement, click-to-index, selection geometry).
+
+    Text uses `set_absolute_size`, so glyph metrics are in device units and do
+    not depend on this surface's resolution — measurements here match what the
+    canvas draws.
+    """
+    global _MEASURE_CR
+    if _MEASURE_CR is None:
+        _MEASURE_CR = cairo.Context(cairo.ImageSurface(cairo.FORMAT_ARGB32, 1, 1))
+    return _MEASURE_CR
 
 
 def _dist_to_segment(px, py, x0, y0, x1, y1):
@@ -324,6 +342,10 @@ class Pen(Annotation):
 class Highlight(Pen):
     color: str = "#ffea00"
     width: float = 22
+    # A marker stroke is defined by where you dragged it, not by a box: scaling
+    # one just smears it. Highlights can be selected, moved and deleted, but not
+    # resized, so they get a frame with no handles.
+    handle_style = "none"
 
     def draw(self, cr, ctx):
         if len(self.points) < 2:
@@ -410,6 +432,95 @@ class Text(Annotation):
 
     def move(self, dx, dy):
         self.x += dx; self.y += dy
+
+    # ------------------------------------------------------ caret / selection
+    # The editor needs to map between character indices and on-canvas positions
+    # so the caret can be placed, moved with the arrow keys and dragged over to
+    # select a range. Pango works in UTF-8 byte offsets; the editor works in
+    # character indices, so everything converts here.
+    def layout(self, cr=None):
+        return self.build_layout(cr if cr is not None else measure_cr())
+
+    def index_to_byte(self, idx):
+        return len((self.text or "")[:idx].encode("utf-8"))
+
+    def byte_to_index(self, b):
+        raw = (self.text or "").encode("utf-8")[:max(0, b)]
+        return len(raw.decode("utf-8", "ignore"))
+
+    @staticmethod
+    def _prev_byte(raw, i):
+        """Step back one UTF-8 character boundary from byte offset `i`."""
+        i -= 1
+        while i > 0 and (raw[i] & 0xC0) == 0x80:
+            i -= 1
+        return max(0, i)
+
+    def caret_rect(self, idx, cr=None):
+        """(x, y, height) of the caret sitting before character `idx`, in image
+        coordinates."""
+        layout = self.layout(cr)
+        pos = layout.index_to_pos(self.index_to_byte(idx))
+        return (self.x + self.PAD + pos.x / Pango.SCALE,
+                self.y + self.PAD + pos.y / Pango.SCALE,
+                (pos.height / Pango.SCALE) or self.size)
+
+    def index_at(self, px, py, cr=None):
+        """Character index nearest the image-space point (px, py)."""
+        layout = self.layout(cr)
+        lx = int((px - self.x - self.PAD) * Pango.SCALE)
+        ly = int((py - self.y - self.PAD) * Pango.SCALE)
+        _inside, bidx, trailing = layout.xy_to_index(lx, ly)
+        return max(0, min(len(self.text or ""),
+                          self.byte_to_index(bidx) + (trailing or 0)))
+
+    def line_of(self, idx, cr=None):
+        """(line_number, line) for the visual line holding character `idx`."""
+        layout = self.layout(cr)
+        line_no, _x = layout.index_to_line_x(self.index_to_byte(idx), False)
+        return line_no, layout.get_line_readonly(line_no)
+
+    def selection_rects(self, i0, i1, cr=None):
+        """Image-space rectangles covering characters [i0, i1) — one per visual
+        line, so a multi-line selection highlights correctly."""
+        if i0 == i1:
+            return []
+        layout = self.layout(cr)
+        raw = (self.text or "").encode("utf-8")
+        b0 = self.index_to_byte(min(i0, i1))
+        b1 = self.index_to_byte(max(i0, i1))
+        out = []
+        it = layout.get_iter()
+        while True:
+            line = it.get_line_readonly()
+            ls, ll = line.start_index, line.length
+            ly0, ly1 = it.get_line_yrange()
+            s, e = max(b0, ls), min(b1, ls + ll)
+            if ll == 0:
+                # A blank line: show a slim marker when it falls inside the range.
+                if b0 <= ls < b1:
+                    x0 = layout.index_to_pos(ls).x / Pango.SCALE
+                    x1 = x0 + self.size * 0.35
+                else:
+                    x0 = x1 = 0.0
+            elif s < e:
+                x0 = layout.index_to_pos(s).x / Pango.SCALE
+                if e >= ls + ll:
+                    # Selection runs to the end of this line: use the right edge
+                    # of its last glyph (alignment-aware, unlike line extents).
+                    p = layout.index_to_pos(self._prev_byte(raw, ls + ll))
+                    x1 = (p.x + p.width) / Pango.SCALE
+                else:
+                    x1 = layout.index_to_pos(e).x / Pango.SCALE
+            else:
+                x0 = x1 = 0.0
+            if x1 > x0:
+                out.append((self.x + self.PAD + min(x0, x1),
+                            self.y + self.PAD + ly0 / Pango.SCALE,
+                            abs(x1 - x0), (ly1 - ly0) / Pango.SCALE))
+            if not it.next_line():
+                break
+        return out
 
 
 @dataclass

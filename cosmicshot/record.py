@@ -12,6 +12,7 @@ compositor's picker) -> OpenPipeWireRemote (fd) -> pipewiresrc -> H.264 -> mp4.
 from __future__ import annotations
 
 import sys
+import time
 
 import gi
 
@@ -358,12 +359,36 @@ class PreviewWindow:
         else:
             box.pack_start(Gtk.Label(label="(preview unavailable)"), True, True, 0)
 
+        # --- timeline: draggable playhead + elapsed / total ---
+        self._duration = 0          # ns, 0 until the demuxer reports it
+        self._seeking = False       # true while the user drags the playhead
+        tl = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        tl.set_margin_start(10); tl.set_margin_end(10); tl.set_margin_top(6)
+        self._seek = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 1, 0.1)
+        self._seek.set_draw_value(False)
+        self._seek.set_hexpand(True)
+        self._seek.set_tooltip_text("Drag to scrub through the recording")
+        # change-value fires for drags, clicks and arrow keys (value-changed would
+        # also fire from our own timer updates and cause a seek feedback loop).
+        self._seek.connect("change-value", self._on_seek)
+        self._seek.connect("button-press-event", self._seek_grab)
+        self._seek.connect("button-release-event", self._seek_release)
+        tl.pack_start(self._seek, True, True, 0)
+        self._time_lbl = Gtk.Label(label="0:00 / 0:00")
+        self._time_lbl.set_width_chars(12)
+        tl.pack_start(self._time_lbl, False, False, 0)
+        box.pack_start(tl, False, False, 0)
+
         bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        bar.set_margin_top(8); bar.set_margin_bottom(8)
+        bar.set_margin_top(6); bar.set_margin_bottom(8)
         bar.set_margin_start(10); bar.set_margin_end(10)
         self._play_btn = Gtk.Button(label="⏸ Pause")
+        self._play_btn.set_tooltip_text("Play / pause (Space)")
         self._play_btn.connect("clicked", self._toggle_play)
         bar.pack_start(self._play_btn, False, False, 0)
+        restart = Gtk.Button(label="↺ Restart")
+        restart.connect("clicked", lambda _b: self._restart())
+        bar.pack_start(restart, False, False, 0)
         bar.pack_end(self._save_btn(), False, False, 0)
         discard = Gtk.Button(label="Discard")
         discard.get_style_context().add_class("destructive-action")
@@ -371,10 +396,111 @@ class PreviewWindow:
         bar.pack_end(discard, False, False, 0)
         box.pack_start(bar, False, False, 0)
 
+        self.win.connect("key-press-event", self._on_key)
+
         self._bus = self._playbin.get_bus()
         self._bus.add_signal_watch()
-        self._bus.connect("message::eos", self._loop)
+        self._bus.connect("message::eos", self._on_eos)
         self._bus.connect("message::error", lambda *_: None)
+        self._poll_id = None
+        self._ended = False
+        self._seek_src = None        # pending throttled seek (GLib source id)
+        self._seek_target = None     # newest requested position
+        self._settle_until = 0.0     # ignore reported positions until this time
+
+    # -- timeline ---------------------------------------------------------
+    @staticmethod
+    def _fmt(ns):
+        secs = max(0, int(ns // Gst.SECOND))
+        return f"{secs // 60}:{secs % 60:02d}"
+
+    def _seek_grab(self, *_):
+        self._seeking = True
+        return False
+
+    def _seek_release(self, *_):
+        self._seeking = False
+        self._flush_seek()          # land exactly where the drag ended
+        return False
+
+    def _on_seek(self, _scale, _scroll_type, value):
+        self._seek_ns(int(value * Gst.SECOND))
+        return False          # let GTK move the slider to `value` as usual
+
+    # Coalesce the flood of seeks a drag produces, and ignore reported positions
+    # for a moment afterwards so a stale one can't yank the playhead back.
+    _SEEK_THROTTLE_MS = 50
+    _SEEK_SETTLE_S = 0.2
+
+    def _seek_ns(self, pos):
+        """Move to `pos`, showing that exact frame even while paused.
+
+        Seeks are ACCURATE, not KEY_UNIT: the hardware H.264 encoder emits
+        barely any keyframes (a 10 s capture can hold a single one), so
+        keyframe-snapped seeks collapsed the whole timeline onto one position
+        and scrubbing did nothing.
+
+        Accurate seeks cost more, so while the playhead is being dragged they
+        are throttled rather than issued per motion event. The playhead and
+        clock move immediately regardless, so dragging always feels live.
+        """
+        self._ended = False       # an explicit seek means "play from here"
+        if self._duration:
+            pos = max(0, min(self._duration, pos))
+        self._seek_target = pos
+        self._seek.set_value(pos / Gst.SECOND)
+        self._refresh_time(pos)
+        if self._seeking:                       # mid-drag: coalesce
+            if self._seek_src is None:
+                self._seek_src = GLib.timeout_add(self._SEEK_THROTTLE_MS,
+                                                  self._flush_seek)
+        else:                                   # a click/key/button: go now
+            self._flush_seek()
+
+    def _flush_seek(self):
+        if self._seek_src is not None:
+            GLib.source_remove(self._seek_src)
+            self._seek_src = None
+        pos, self._seek_target = self._seek_target, None
+        if pos is None or self._playbin is None:
+            return False
+        try:
+            self._playbin.seek_simple(
+                Gst.Format.TIME,
+                Gst.SeekFlags.FLUSH | Gst.SeekFlags.ACCURATE, pos)
+        except Exception:
+            pass
+        self._settle_until = time.monotonic() + self._SEEK_SETTLE_S
+        return False              # never repeat as a timeout source
+
+    def _refresh_time(self, pos):
+        self._time_lbl.set_text(f"{self._fmt(pos)} / {self._fmt(self._duration)}")
+
+    def _poll(self):
+        """Keep the playhead and the time label in step with the player."""
+        if self._playbin is None:
+            return False
+        if self._duration <= 0:
+            ok, dur = self._playbin.query_duration(Gst.Format.TIME)
+            if ok and dur > 0:
+                self._duration = dur
+                self._seek.set_range(0, dur / Gst.SECOND)
+        if (self._ended or self._seeking or self._seek_target is not None
+                or time.monotonic() < self._settle_until):
+            return True          # parked, dragging, or just sought: hands off
+        ok, pos = self._playbin.query_position(Gst.Format.TIME)
+        if not ok or pos < 0:
+            return True
+        self._seek.set_value(pos / Gst.SECOND)
+        self._refresh_time(pos)
+        return True
+
+    def _on_key(self, _w, ev):
+        from gi.repository import Gdk
+        if ev.keyval == Gdk.KEY_space:
+            self._toggle_play(None)
+            return True
+        return False
 
     def _save_btn(self):
         from gi.repository import Gtk
@@ -384,16 +510,41 @@ class PreviewWindow:
         return b
 
     def _toggle_play(self, _b):
-        ok, state, _ = self._playbin.get_state(0)
+        _ok, state, _ = self._playbin.get_state(0)
         if state == Gst.State.PLAYING:
-            self._playbin.set_state(Gst.State.PAUSED); self._play_btn.set_label("▶ Play")
+            self._playbin.set_state(Gst.State.PAUSED)
+            self._play_btn.set_label("▶ Play")
         else:
-            self._playbin.set_state(Gst.State.PLAYING); self._play_btn.set_label("⏸ Pause")
+            if self._ended:          # parked on the last frame -> play again
+                self._seek_ns(0)
+            self._playbin.set_state(Gst.State.PLAYING)
+            self._play_btn.set_label("⏸ Pause")
 
-    def _loop(self, *_):
-        self._playbin.seek_simple(Gst.Format.TIME, Gst.SeekFlags.FLUSH, 0)
+    def _restart(self):
+        self._seek_ns(0)
+        self._playbin.set_state(Gst.State.PLAYING)
+        self._play_btn.set_label("⏸ Pause")
+
+    def _on_eos(self, *_):
+        """Hold on the last frame at the end of the clip.
+
+        It used to seek back to 0 and keep playing, which restarted the
+        recording under you while you were still looking at the end of it.
+        """
+        self._playbin.set_state(Gst.State.PAUSED)
+        self._ended = True
+        if self._duration:
+            self._seek.set_value(self._duration / Gst.SECOND)
+            self._refresh_time(self._duration)
+        self._play_btn.set_label("▶ Play")
 
     def _stop_player(self):
+        if self._poll_id is not None:
+            GLib.source_remove(self._poll_id)
+            self._poll_id = None
+        if self._seek_src is not None:
+            GLib.source_remove(self._seek_src)
+            self._seek_src = None
         try:
             self._playbin.set_state(Gst.State.NULL)
         except Exception:
@@ -457,6 +608,8 @@ class PreviewWindow:
     def run(self):
         self.win.show_all()
         self._playbin.set_state(Gst.State.PLAYING)
+        # 100 ms keeps the playhead smooth without being noticeable work.
+        self._poll_id = GLib.timeout_add(100, self._poll)
 
 
 class RecordingSession:

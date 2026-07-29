@@ -104,7 +104,9 @@ def _build_menu():
                           lambda *_: GLib.idle_add(lambda: (_launch(["settings"]), False)[1]))
     menu.append(settings_item)
     quit_item = _menu_item("Quit CosmicShot", "application-exit-symbolic")
-    quit_item.connect("activate", lambda *_: Gtk.main_quit())
+    # Same guard as the recording menu: if a recording started after this menu
+    # was built, quitting would orphan it.
+    quit_item.connect("activate", _quit_while_recording)
     menu.append(quit_item)
     menu.show_all()
     return menu
@@ -122,15 +124,56 @@ def _stop_recording(*_):
             pass
 
 
+def _quit_while_recording(*_):
+    """Quit is guarded during a recording.
+
+    The encoder lives in the recording process, not here, so plain-quitting the
+    tray leaves the recording running with no way to stop it (full-screen
+    recordings have no floating card). Ask first, and always stop the recording
+    before quitting.
+    """
+    from . import lock
+    if lock.recording_pid() is None:
+        Gtk.main_quit()          # it already finished; nothing to protect
+        return
+    dlg = Gtk.MessageDialog(
+        transient_for=None, modal=True, message_type=Gtk.MessageType.WARNING,
+        text="A recording is still in progress")
+    dlg.format_secondary_text(
+        "Quitting now would leave it recording in the background with no way "
+        "to stop it. Stop the recording first?")
+    dlg.add_button("Keep recording", Gtk.ResponseType.CANCEL)
+    dlg.add_button("Stop and quit", Gtk.ResponseType.REJECT)
+    stop_btn = dlg.add_button("Stop recording", Gtk.ResponseType.ACCEPT)
+    stop_btn.get_style_context().add_class("suggested-action")
+    dlg.set_default_response(Gtk.ResponseType.ACCEPT)
+    dlg.set_keep_above(True)
+    resp = dlg.run()
+    dlg.destroy()
+    if resp in (Gtk.ResponseType.ACCEPT, Gtk.ResponseType.REJECT):
+        _stop_recording()
+    if resp == Gtk.ResponseType.REJECT:
+        # Give the recording process a moment to take the signal and open its
+        # save/preview window before this tray goes away.
+        GLib.timeout_add(400, lambda: (Gtk.main_quit(), False)[1])
+
+
 def _build_recording_menu():
+    """While recording, the panel offers Stop and nothing else.
+
+    Quit is deliberately absent: it sits one slot away from Stop, and picking it
+    by mistake used to kill the panel while the recording carried on in the
+    background with no way to stop it. Stop the recording first — the normal
+    menu (with Quit) comes back the moment it ends.
+    """
     menu = Gtk.Menu()
+    header = Gtk.MenuItem(label="●  Recording…")
+    header.set_sensitive(False)
+    menu.append(header)
+    menu.append(Gtk.SeparatorMenuItem())
     stop = Gtk.MenuItem(label="⏹  Stop recording")
     stop.connect("activate", _stop_recording)
     menu.append(stop)
-    menu.append(Gtk.SeparatorMenuItem())
-    quit_item = Gtk.MenuItem(label="Quit CosmicShot")
-    quit_item.connect("activate", lambda *_: Gtk.main_quit())
-    menu.append(quit_item)
     menu.show_all()
     return menu
 

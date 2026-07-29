@@ -41,10 +41,23 @@ def _arrow_shape(cr, x0, y0, x1, y1, lw, hl, hw):
 
 
 def _select(cr):
-    for x, y in [(5, 3), (5, 18.5), (9, 14.4), (11.6, 20.5),
-                 (13.9, 19.4), (11.2, 13.6), (16, 13.6)]:
-        cr.line_to(x, y)
-    cr.close_path()
+    """An open hand: the Select tool grabs and moves shapes, and its canvas
+    cursor is the matching grab hand.
+
+    Built from round-capped capsules (fingers/thumb) merged with a rounded palm
+    — the same opaque colour throughout, so the overlaps read as one silhouette.
+    Fingertips are staggered like a real hand; that outline, not the hairline
+    gaps between fingers, is what makes it legible at 18 px.
+    """
+    cr.set_line_width(2.2)                      # finger thickness
+    for x, top in ((9.2, 6.3), (12.3, 5.0), (15.4, 5.8), (18.4, 7.8)):
+        cr.move_to(x, 12.6)                     # down into the palm, so they merge
+        cr.line_to(x, top)
+        cr.stroke()
+    cr.move_to(8.9, 14.0)                       # thumb, angled off the palm
+    cr.line_to(5.5, 11.4)
+    cr.stroke()
+    _round_rect(cr, 7.8, 10.3, 11.9, 8.7, 3.0)  # palm
     cr.fill()
 
 
@@ -118,18 +131,20 @@ def _counter(cr):
 
 
 def _blur(cr):
-    n, g, s0 = 3, 0.8, 5.0
-    cell = (14 - (n - 1) * g) / n
+    """A pixelation mosaic: a 4x4 checkerboard of filled blocks.
+
+    Every block is filled — the earlier version outlined the alternate cells,
+    and at 18 px those 1.2-wide strokes muddied into a dark blob. Filled-only
+    keeps the checkerboard legible and the weight in line with the outline icons.
+    """
+    n, g, s0, span = 4, 0.9, 4.2, 15.6
+    cell = (span - (n - 1) * g) / n
     for i in range(n):
         for j in range(n):
-            x = s0 + i * (cell + g)
-            y = s0 + j * (cell + g)
-            cr.rectangle(x, y, cell, cell)
-            if (i + j) % 2 == 0:
-                cr.fill()
-            else:
-                cr.set_line_width(1.2)
-                cr.stroke()
+            if (i + j) % 2:
+                continue
+            cr.rectangle(s0 + i * (cell + g), s0 + j * (cell + g), cell, cell)
+    cr.fill()
 
 
 def _spotlight(cr):

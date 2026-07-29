@@ -57,28 +57,46 @@ No-repo options are in [Other ways to install](#other-ways-to-install).
   - A **red ● recording control** lets you Stop/Cancel; for full-screen the Stop
     button moves to the panel (a red ⏹) so nothing of CosmicShot is in the
     recording. You can also stop from a hotkey bound to `cosmicshot record --stop`.
-  - After recording, a **preview player** lets you watch it, then **Save As…**
+  - After recording, a **preview player** with a scrubbable timeline (playhead,
+    elapsed / total, `Space` to play-pause) lets you watch it, then **Save As…**
     (remembers the last folder) or **Discard**.
 - **Instant annotation editor** with tools:
   - **Direct manipulation with any tool** — hover a shape (it highlights), drag
     its body to move or a handle to resize; arrows/lines have endpoint handles,
     boxes have 8. New shapes are auto-selected. `Delete` removes the selection;
     changing the colour re-colours it. The **Select** tool (`V`) rearranges only.
-  - Arrow, Rectangle, Ellipse, Line
-  - Freehand Pen, Highlighter (marker)
-  - **Text boxes** — type in place; **click a text to re-edit** it. The box
+  - Arrow, Rectangle, Line — **Snap 15°** (on by default) locks lines and
+    arrows to fixed angles, including perfectly straight ones; hold `Shift` for
+    a free angle.
+  - **Ellipse** — **Circle** (off by default) forces a perfect circle while
+    drawing *and* while resizing; hold `Shift` for a circle on demand.
+  - Freehand Pen
+  - **Highlighter** (marker) — **Straight** (on by default) lays one straight,
+    angle-snapped stroke so it follows a line of text exactly; hold `Shift` (or
+    untick it) to draw freehand. Highlights can be moved and deleted but never
+    resized — scaling a marker stroke only smears it.
+  - **Text boxes** — type in place with a real caret: arrow-key navigation,
+    word jumps, `Shift`-selection, `Ctrl+A`, click/drag to select, double-click a
+    word, and text copy/cut/paste. **Click a text to re-edit** it. The box
     auto-grows and wraps when you drag a handle to set a width (resizing changes
     the **box width, never the font**). Left / centre / right / justify.
+  - **Copy / paste elements** — `Ctrl+C` / `Ctrl+X` / `Ctrl+V` duplicate the
+    selected annotation.
   - **Blur / pixelate** for redacting sensitive info — adjustable strength
   - **Spotlight / focus** — darkens everything outside a resizable box
   - **Numbered step counters** (auto-incrementing)
   - **Crop** — drag, then **Apply crop** (or `Enter`); keep annotating cropped.
-  - Context-aware style control: Thickness / Font size / Blur / Darkness.
+    A **Ratio** dropdown holds a strict aspect (`1:1`, `4:3`, `3:4`, `3:2`,
+    `2:3`, `16:9`, `9:16`) or **Free**; the outlined rect never leaves the image,
+    so a locked ratio survives the edges. `Shift` frees a set ratio, or squares
+    a free crop.
+  - Context-aware style control: Thickness / Snap angle / Straight / Circle /
+    crop Ratio / Font size / Blur / Darkness — only the one that applies shows.
 - **Undo / redo** (full history, including crop, move, and resize).
 - **Close confirmation** — closing with unsaved edits asks Save / Discard / Cancel.
 - **Cloud upload** — one click uploads and copies a shareable URL to your
   clipboard (default host: catbox.moe — free, no account, permanent). `Ctrl+U`.
-- **Copy to clipboard** or **Save PNG** — `Ctrl+C` / `Ctrl+S`.
+- **Copy to clipboard** or **Save PNG** — the toolbar buttons (or `Ctrl+S`).
 - **Settings** — version, one-click updates, and global keyboard shortcuts.
 - **Panel tray icon** with a capture/record menu, auto-started at login.
 
@@ -140,7 +158,9 @@ cosmicshot tray                      # run the panel tray icon
 
 The installer starts the tray automatically at login. It adds an icon to the
 COSMIC panel with a capture/record menu, plus **Settings…**. While a full-screen
-recording is running the icon turns into a red ⏹ **Stop recording** button.
+recording is running the icon turns into a red ⏹ **Stop recording** button. Quit
+is guarded while recording: it asks first and always stops the recording, so one
+can never be orphaned in the background.
 
 > Needs `gir1.2-ayatanaappindicator3-0.1` (present on most COSMIC installs; the
 > `.deb` recommends it).
@@ -168,9 +188,19 @@ Open **Settings…** from the tray (or `cosmicshot settings`):
 | `L` | Line | `Delete` | Delete selected shape |
 | `P` | Pen | `O` | Spotlight / focus |
 | `H` | Highlighter | `Ctrl+Z` / `Ctrl+Shift+Z` | Undo / Redo |
-| `Ctrl+C` | Copy | `Ctrl+S` | Save |
+| `Ctrl+C` / `Ctrl+X` / `Ctrl+V` | Copy / cut / paste the **selected element** | `Ctrl+S` | Save |
 | `Ctrl+U` | Upload & copy URL | `Enter` | Apply pending crop |
-| `Esc` | Cancel / close (confirms if unsaved) | | |
+| `Shift` (while drawing) | Invert the active constraint | `Esc` | Deselect / cancel crop |
+
+The editor is only left through its **Copy**, **Save**, **Upload** or window-close
+buttons — `Esc` never closes it, and `Ctrl+C` copies the selected annotation
+rather than the whole image.
+
+While typing in a text box: arrow keys / `Home` / `End` move the caret
+(`Ctrl` for whole words), `Shift` extends the selection, `Ctrl+A` selects all,
+`Ctrl+C` / `Ctrl+X` / `Ctrl+V` work on the text, click or drag inside the box to
+place the caret or select a range, double-click a word, triple-click for
+everything. `Shift+Enter` adds a line, `Enter` or `Esc` finishes the box.
 
 ## Configuration
 
@@ -185,6 +215,10 @@ Edit `~/.config/cosmicshot/config.json` (created on first run). Notable keys:
   "palette": ["#ff3b30", "#ff9500", "...", "#ffffff"],
   "pixelate_block": 12,        // default blur tool strength
   "spotlight_darkness": 0.6,   // 0..0.95
+  "angle_snap_lock": true,     // lines/arrows snap to 15° (Shift inverts)
+  "highlight_straight": true,  // highlighter draws one straight stroke
+  "ellipse_circle_lock": false,// ellipse forces a perfect circle
+  "crop_ratio": "Free",        // or "1:1", "4:3", "3:4", "3:2", "2:3", "16:9", "9:16"
   "auto_copy_on_capture": false,
   "copy_on_save": true,        // also copy when saving / pinning
   "auto_update": false,        // check GitHub for updates on launch + periodically
