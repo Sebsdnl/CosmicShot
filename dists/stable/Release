@@ -1,0 +1,23 @@
+Architectures: all
+Codename: stable
+Components: main
+Date: Thu, 30 Jul 2026 09:52:32 +0000
+Label: CosmicShot
+Origin: CosmicShot
+Suite: stable
+MD5Sum:
+ fb80a6cff391664ce1e85d25411b82ad              142 Release
+ 7a4e7799da163579594b209af1ad3ed8            21861 main/binary-all/Packages
+ c770094bb1d60fde0e91b3c1f61e3dbf             3628 main/binary-all/Packages.gz
+SHA1:
+ 53349ec034b55566846ad75b7697e203569413a5              142 Release
+ 2c5d412621f1fe73b4639fdb1e1427426938e269            21861 main/binary-all/Packages
+ 5a0cd08ae2998b7b1bc39d60861b470e19da67fd             3628 main/binary-all/Packages.gz
+SHA256:
+ 42899554841f0ffacd2ef292d11b621076a1029d5da3284752880aa7e6d52998              142 Release
+ cfd4d2abdfe9833ed8223ba484188c4dfa4e1d99485906e5e059f91e23fc47a8            21861 main/binary-all/Packages
+ 3a4a5f7bc0cef2ffcc50223d0129d6887d96930adbb8a84fd41fcc41020356bb             3628 main/binary-all/Packages.gz
+SHA512:
+ 636e41b14c2df474e9d72d3e4d991640af1064dd023ce85b014ea0b293e66b437d8c274031afd61f38aa5e338c1d306d8e796c70db2e064e1cf2075c192a0e12              142 Release
+ 68dd3cc0b7b2ad9bf6f8878958640f4e7c2d243fa50e65450b40104a782bfc1bc20d2ae3f56ee0860a874044e9889881328c75625e37e0dd005ef978df71290a            21861 main/binary-all/Packages
+ 3d6d95dc222a96389070c6c8d64a61ba29d4a7fdf6929dce046dfe74a788642a6481aba28c26af0a178b9be572b4f279ed7df622cf3d0e41c2339ca6f9a6b0fe             3628 main/binary-all/Packages.gz
