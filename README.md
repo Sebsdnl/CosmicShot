@@ -62,6 +62,13 @@ No-repo options are in [Other ways to install](#other-ways-to-install).
     seeking so you can land on the exact frame you want. It holds on the last
     frame rather than looping. Then **Save As…** (remembers the last folder) or
     **Discard**.
+  - **Trim before saving**, QuickTime-style: drag either **yellow end** of the
+    timeline inward to cut off a false start or a fumbled ending. What falls
+    outside is dimmed, and playback stays inside the kept range so you see
+    exactly what you'll get. `[` and `]` trim to the playhead; **Reset trim**
+    puts it all back. **Save trimmed** re-encodes just that range, so the cut
+    lands on the frame you chose instead of snapping to the nearest keyframe (a
+    hardware-encoded capture can hold a single one) — audio comes along.
 - **Instant annotation editor** with tools:
   - **Direct manipulation with any tool** — hover a shape (it highlights), drag
     its body to move or a handle to resize; arrows/lines have endpoint handles,
@@ -251,7 +258,7 @@ cosmicshot/
   capture.py    cosmic-screenshot wrapper + monitor geometry
   overlay.py    dimmed region selector + screen/window pickers + scroll capture
   scroll.py     scrolling-screenshot frame stitcher
-  record.py     ScreenCast-portal recording (pipeline, control, preview)
+  record.py     ScreenCast-portal recording (pipeline, control, preview, trim)
   audio.py      audio-source discovery + picker
   windows.py    per-window geometry (COSMIC toplevel-info protocol)
   editor.py     annotation editor window (canvas, toolbar, undo/redo)

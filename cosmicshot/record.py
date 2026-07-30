@@ -49,6 +49,29 @@ def _have(element: str) -> bool:
     return Gst.ElementFactory.find(element) is not None
 
 
+def _h264_chain() -> str:
+    """H.264 encoder + parser, hardware VAAPI first, software after."""
+    if _have("vah264enc"):
+        return "vah264enc ! h264parse"
+    if _have("openh264enc"):
+        return "openh264enc ! h264parse"
+    if _have("x264enc"):
+        return "x264enc tune=zerolatency speed-preset=veryfast ! h264parse"
+    raise RuntimeError("No H.264 encoder (install gstreamer1.0-vaapi or "
+                       "gstreamer1.0-plugins-ugly).")
+
+
+def _aac_chain():
+    """AAC encoder (+ parser when available), or None if neither is installed."""
+    if _have("avenc_aac"):
+        enc = "avenc_aac"
+    elif _have("voaacenc"):
+        enc = "voaacenc"
+    else:
+        return None
+    return enc + (" ! aacparse" if _have("aacparse") else "")
+
+
 class ScreenCastPortal:
     """Runs the ScreenCast portal handshake on the default GLib main context."""
 
@@ -166,30 +189,18 @@ class Recorder:
         self._crop_fraction = None
 
     def _encoder_chain(self):
-        # Prefer hardware VAAPI; fall back to software openh264.
-        if _have("vah264enc"):
-            return "vah264enc ! h264parse"
-        if _have("openh264enc"):
-            return "openh264enc ! h264parse"
-        if _have("x264enc"):
-            return "x264enc tune=zerolatency speed-preset=veryfast ! h264parse"
-        raise RuntimeError("No H.264 encoder (install gstreamer1.0-vaapi or "
-                           "gstreamer1.0-plugins-ugly).")
+        return _h264_chain()
 
     def _audio_chain(self):
         """A pulsesrc -> AAC branch feeding the named mux, or None if no AAC
         encoder is installed (then we record video-only)."""
-        if _have("avenc_aac"):
-            enc = "avenc_aac"
-        elif _have("voaacenc"):
-            enc = "voaacenc"
-        else:
+        aac = _aac_chain()
+        if aac is None:
             print("[record] no AAC encoder — recording without audio",
                   file=sys.stderr, flush=True)
             return None
-        parse = "aacparse ! " if _have("aacparse") else ""
         return (f"pulsesrc name=asrc do-timestamp=true ! queue ! audioconvert ! "
-                f"audioresample ! {enc} ! {parse}queue ! mux.")
+                f"audioresample ! {aac} ! queue ! mux.")
 
     def build(self, fd: int, node_id: int, audio_device=None):
         # videocrop is always present (pass-through when not cropping). For a
@@ -326,9 +337,397 @@ class _RegionDim:
         self.windows = []
 
 
+def _uri(path: str) -> str:
+    """file:// URI for a local path — via GLib, so spaces and #? survive."""
+    try:
+        return Gst.filename_to_uri(path)
+    except Exception:
+        return "file://" + path
+
+
+def _has_audio_track(path: str) -> bool:
+    try:
+        gi.require_version("GstPbutils", "1.0")
+        from gi.repository import GstPbutils
+        info = GstPbutils.Discoverer.new(5 * Gst.SECOND).discover_uri(_uri(path))
+        return bool(info.get_audio_streams())
+    except Exception as exc:
+        print(f"[trim] audio probe failed ({exc}) — assuming video only",
+              file=sys.stderr, flush=True)
+        return False
+
+
+def trim_clip(src: str, dst: str, start_ns: int, end_ns: int, on_progress=None):
+    """Write src[start_ns:end_ns] to dst. Returns None on success, else a
+    human-readable error string (the caller then keeps the untrimmed clip).
+
+    Re-encodes rather than stream-copies on purpose: the hardware H.264 encoder
+    emits barely any keyframes (a 10 s capture can hold a single one), so a
+    copy-mode cut would snap the in-point back to the start of the file. Same
+    reason the seek below is ACCURATE.
+
+    `on_progress(fraction | None)` is called every ~100 ms; it must pump the GTK
+    main loop itself if it draws anything.
+    """
+    import os
+    _gst()
+    try:
+        vchain = _h264_chain()
+    except RuntimeError as exc:
+        return str(exc)
+    aac = _aac_chain()
+    audio = aac is not None and _has_audio_track(src)
+    # decodebin's pads appear late, so each branch starts with an element that
+    # accepts ONE medium (videoconvert / audioconvert). Starting a branch with a
+    # `queue` instead would let the deferred link put audio in the video branch,
+    # since a queue accepts anything.
+    desc = (f"filesrc name=src ! decodebin name=dec "
+            f"dec. ! videoconvert ! queue ! {vchain} ! "
+            f"mp4mux name=mux faststart=true ! filesink name=sink")
+    if audio:
+        desc += f" dec. ! audioconvert ! audioresample ! queue ! {aac} ! mux."
+    try:
+        pipe = Gst.parse_launch(desc)
+    except Exception as exc:
+        return f"could not build the trim pipeline: {exc}"
+    # Paths go on the elements, never in the parse string: parse_launch is not a
+    # shell, so spaces in a filename would corrupt the description.
+    pipe.get_by_name("src").set_property("location", src)
+    pipe.get_by_name("sink").set_property("location", dst)
+
+    err = None
+    try:
+        pipe.set_state(Gst.State.PAUSED)
+        # Preroll before seeking: a seek on a not-yet-prerolled pipeline is
+        # simply refused.
+        if pipe.get_state(10 * Gst.SECOND)[0] == Gst.StateChangeReturn.FAILURE:
+            return "the clip could not be opened for trimming"
+        # A normal (non-SEGMENT) seek with a stop time makes the pipeline emit
+        # EOS at `end_ns`, which is also what makes mp4mux finalise the file.
+        # After a flushing seek, running time restarts at 0, so the output
+        # starts at the in-point rather than carrying its old timestamps.
+        #
+        # Sent to the demuxer, not the pipeline: a pipeline-wide seek also
+        # reaches filesink, whose segment is in BYTES, and it answers a TIME
+        # seek with a GStreamer-CRITICAL. Same cut either way, minus the noise.
+        seek = Gst.Event.new_seek(
+            1.0, Gst.Format.TIME, Gst.SeekFlags.FLUSH | Gst.SeekFlags.ACCURATE,
+            Gst.SeekType.SET, int(start_ns), Gst.SeekType.SET, int(end_ns))
+        if not pipe.get_by_name("dec").send_event(seek):
+            return "the trim points could not be applied to this clip"
+        pipe.set_state(Gst.State.PLAYING)
+        span = max(1, int(end_ns) - int(start_ns))
+        # Generous: re-encoding runs faster than real time on any encoder we
+        # pick, so this only ever fires on a genuinely stuck pipeline.
+        deadline = time.monotonic() + 60 + 20 * (span / Gst.SECOND)
+        bus = pipe.get_bus()
+        while True:
+            msg = bus.timed_pop_filtered(
+                100 * Gst.MSECOND, Gst.MessageType.EOS | Gst.MessageType.ERROR)
+            if msg is not None:
+                if msg.type == Gst.MessageType.ERROR:
+                    gerr, dbg = msg.parse_error()
+                    print(f"[trim] GST ERROR: {gerr.message} | {dbg}",
+                          file=sys.stderr, flush=True)
+                    err = gerr.message
+                break
+            if time.monotonic() > deadline:
+                err = "trimming timed out"
+                break
+            if on_progress is not None:
+                ok, pos = pipe.query_position(Gst.Format.TIME)
+                on_progress((pos - start_ns) / span if ok and pos >= 0 else None)
+    finally:
+        pipe.set_state(Gst.State.NULL)
+
+    if err is None and (not os.path.exists(dst) or os.path.getsize(dst) < 1024):
+        err = "the trimmed file came out empty"
+    if err is not None:
+        try:
+            if os.path.exists(dst):
+                os.unlink(dst)
+        except OSError:
+            pass
+    return err
+
+
+class _TrimProgress:
+    """Modal 'Trimming…' bar shown while trim_clip() runs."""
+
+    def __init__(self, parent):
+        from gi.repository import Gtk
+        self._Gtk = Gtk
+        self.dlg = Gtk.Dialog(title="Trimming", transient_for=parent, modal=True)
+        self.dlg.set_deletable(False)
+        self.dlg.set_default_size(320, -1)
+        box = self.dlg.get_content_area()
+        box.set_spacing(10)
+        for setter in ("set_margin_top", "set_margin_bottom",
+                       "set_margin_start", "set_margin_end"):
+            getattr(box, setter)(14)
+        box.add(Gtk.Label(label="Trimming the recording…"))
+        self.bar = Gtk.ProgressBar()
+        box.add(self.bar)
+        self.dlg.show_all()
+        self.pump()
+
+    def __call__(self, fraction):
+        if fraction is None:
+            self.bar.pulse()
+        else:
+            self.bar.set_fraction(max(0.0, min(1.0, fraction)))
+        self.pump()
+
+    def pump(self):
+        # We're called from a button handler inside Gtk.main(); iterate by hand
+        # so the bar actually moves. The dialog is modal, so nothing else in the
+        # app can be clicked while we do.
+        while self._Gtk.events_pending():
+            self._Gtk.main_iteration_do(False)
+
+    def destroy(self):
+        self.dlg.destroy()
+        self.pump()
+
+
+def _rounded(cr, x, y, w, h, r):
+    import math
+    r = min(r, w / 2, h / 2)
+    cr.new_sub_path()
+    cr.arc(x + w - r, y + r, r, -math.pi / 2, 0)
+    cr.arc(x + w - r, y + h - r, r, 0, math.pi / 2)
+    cr.arc(x + r, y + h - r, r, math.pi / 2, math.pi)
+    cr.arc(x + r, y + r, r, math.pi, 3 * math.pi / 2)
+    cr.close_path()
+
+
+class _TrimBar:
+    """QuickTime-style trim strip: a scrubbable timeline whose two ends can be
+    dragged inward to choose what is kept. What falls outside is dimmed; the
+    kept range carries a yellow frame with a grip at each end.
+
+    Deliberately not a Gtk.DrawingArea subclass: this module imports Gtk lazily
+    so it can pin the GTK 3 stack, and subclassing would need it at import time.
+    """
+
+    HEIGHT = 46
+    PAD = 12              # room for a handle when a trim point sits at an end
+    HANDLE_W = 11
+    GRAB = 14             # px around a trim point where a press grabs it
+    MIN_SEL_NS = 300 * Gst.MSECOND
+
+    def __init__(self, on_seek, on_trim):
+        from gi.repository import Gdk, Gtk
+        self._on_seek = on_seek        # (ns, dragging) -> None
+        self._on_trim = on_trim        # () -> None, after a handle is released
+        self.duration = 0
+        self.pos = 0
+        self.start = 0
+        self.end = 0
+        self._drag = None              # None | "start" | "end" | "pos"
+        self._cursor = None
+        w = Gtk.DrawingArea()
+        w.set_size_request(-1, self.HEIGHT)
+        w.add_events(Gdk.EventMask.BUTTON_PRESS_MASK
+                     | Gdk.EventMask.BUTTON_RELEASE_MASK
+                     | Gdk.EventMask.POINTER_MOTION_MASK
+                     | Gdk.EventMask.LEAVE_NOTIFY_MASK)
+        w.connect("draw", self._draw)
+        w.connect("button-press-event", self._press)
+        w.connect("button-release-event", self._release)
+        w.connect("motion-notify-event", self._motion)
+        w.connect("leave-notify-event", self._leave)
+        w.set_tooltip_text("Click or drag to scrub · drag either yellow end to "
+                           "trim · [ and ] trim to the playhead")
+        self.widget = w
+
+    # -- state ------------------------------------------------------------
+    @property
+    def trimmed(self) -> bool:
+        return self.duration > 0 and (self.start > 0 or self.end < self.duration)
+
+    @property
+    def selection_ns(self) -> int:
+        return max(0, self.end - self.start)
+
+    def set_duration(self, ns):
+        """Called once the demuxer reports the length; keeps any trim the user
+        already made (they can't have made one before this, but be safe)."""
+        first = self.duration <= 0
+        self.duration = ns
+        if first or self.end > ns:
+            self.end = ns
+        self.start = max(0, min(self.start, max(0, ns - self.MIN_SEL_NS)))
+        self.widget.queue_draw()
+
+    def set_position(self, ns):
+        self.pos = ns
+        self.widget.queue_draw()
+
+    def reset(self):
+        self.start, self.end = 0, self.duration
+        self.widget.queue_draw()
+        self._on_trim()
+
+    def trim_to_playhead(self, which):
+        """`[` / `]`: pull the near end in to where the playhead sits."""
+        if self.duration <= 0:
+            return
+        if which == "start":
+            self.start = max(0, min(self.pos, self.end - self.MIN_SEL_NS))
+        else:
+            self.end = min(self.duration, max(self.pos, self.start + self.MIN_SEL_NS))
+        self.widget.queue_draw()
+        self._on_trim()
+
+    # -- geometry ---------------------------------------------------------
+    def _track(self):
+        a = self.widget.get_allocation()
+        return self.PAD, max(self.PAD + 1, a.width - self.PAD), a.height
+
+    def _x(self, ns):
+        x0, x1, _h = self._track()
+        if self.duration <= 0:
+            return x0
+        return x0 + (x1 - x0) * max(0.0, min(1.0, ns / self.duration))
+
+    def _ns(self, x):
+        x0, x1, _h = self._track()
+        if x1 <= x0 or self.duration <= 0:
+            return 0
+        return int(self.duration * max(0.0, min(1.0, (x - x0) / (x1 - x0))))
+
+    # -- drawing ----------------------------------------------------------
+    def _draw(self, _w, cr):
+        x0, x1, h = self._track()
+        top, bot = 4.0, h - 4.0
+        if bot <= top:
+            return False
+        xs, xe = self._x(self.start), self._x(self.end)
+
+        _rounded(cr, x0, top, x1 - x0, bot - top, 5)
+        cr.set_source_rgb(0.15, 0.16, 0.19)          # empty track
+        cr.fill()
+        cr.rectangle(xs, top, max(1.0, xe - xs), bot - top)
+        cr.set_source_rgb(0.30, 0.32, 0.38)          # the part being kept
+        cr.fill()
+        cr.set_source_rgba(0, 0, 0, 0.45)            # the parts being cut
+        if xs > x0:
+            cr.rectangle(x0, top, xs - x0, bot - top)
+        if xe < x1:
+            cr.rectangle(xe, top, x1 - xe, bot - top)
+        cr.fill()
+
+        cr.set_source_rgb(1.0, 0.84, 0.04)           # yellow trim frame
+        cr.set_line_width(3)
+        for y in (top + 1.5, bot - 1.5):
+            cr.move_to(xs, y)
+            cr.line_to(xe, y)
+        cr.stroke()
+        # Handles sit OUTSIDE the selection, so they can never overlap each
+        # other however tight the trim gets.
+        for hx, left in ((xs, True), (xe, False)):
+            gx = hx - self.HANDLE_W if left else hx
+            _rounded(cr, gx, top, self.HANDLE_W, bot - top, 4)
+            cr.set_source_rgb(1.0, 0.84, 0.04)
+            cr.fill()
+            cr.set_source_rgb(0.25, 0.20, 0.0)       # grip lines
+            cr.set_line_width(1.5)
+            mid = (top + bot) / 2
+            for dx in (-2.0, 2.0):
+                cr.move_to(gx + self.HANDLE_W / 2 + dx, mid - 6)
+                cr.line_to(gx + self.HANDLE_W / 2 + dx, mid + 6)
+            cr.stroke()
+
+        if self.duration > 0:                        # playhead
+            px = round(self._x(max(self.start, min(self.end, self.pos)))) + 0.5
+            cr.set_line_width(3)
+            cr.set_source_rgba(0, 0, 0, 0.5)
+            cr.move_to(px, top)
+            cr.line_to(px, bot)
+            cr.stroke()
+            cr.set_line_width(1.5)
+            cr.set_source_rgb(1, 1, 1)
+            cr.move_to(px, top)
+            cr.line_to(px, bot)
+            cr.stroke()
+        return False
+
+    # -- input ------------------------------------------------------------
+    def _grabbable(self, x):
+        if self.duration <= 0:
+            return None
+        d_s, d_e = abs(x - self._x(self.start)), abs(x - self._x(self.end))
+        if min(d_s, d_e) > self.GRAB:
+            return None
+        return "start" if d_s <= d_e else "end"
+
+    def _press(self, _w, ev):
+        if ev.button != 1 or self.duration <= 0:
+            return False
+        self._drag = self._grabbable(ev.x) or "pos"
+        self._apply(ev.x)
+        return True
+
+    def _motion(self, _w, ev):
+        if self._drag is None:
+            self._hover(ev.x)
+            return False
+        self._apply(ev.x)
+        return True
+
+    def _release(self, _w, ev):
+        if self._drag is None:
+            return False
+        was, self._drag = self._drag, None
+        self._on_seek(self.pos, False)     # land exactly where the drag ended
+        if was in ("start", "end"):
+            self._on_trim()
+        self.widget.queue_draw()
+        return True
+
+    def _apply(self, x):
+        ns = self._ns(x)
+        if self._drag == "start":
+            self.start = max(0, min(ns, self.end - self.MIN_SEL_NS))
+            self.pos = self.start
+        elif self._drag == "end":
+            self.end = min(self.duration, max(ns, self.start + self.MIN_SEL_NS))
+            self.pos = self.end          # show the frame you're cutting at
+        else:
+            self.pos = max(self.start, min(self.end, ns))
+        self.widget.queue_draw()
+        self._on_seek(self.pos, True)
+
+    def _hover(self, x):
+        from gi.repository import Gdk
+        win = self.widget.get_window()
+        if win is None:
+            return
+        name = "col-resize" if self._grabbable(x) else "pointer"
+        if name == self._cursor:
+            return
+        self._cursor = name
+        try:
+            win.set_cursor(Gdk.Cursor.new_from_name(win.get_display(), name))
+        except Exception:
+            pass
+
+    def _leave(self, *_):
+        win = self.widget.get_window()
+        if win is not None and self._cursor is not None:
+            self._cursor = None
+            try:
+                win.set_cursor(None)
+            except Exception:
+                pass
+        return False
+
+
 class PreviewWindow:
-    """Plays the just-recorded clip and offers Save / Discard. Closing without
-    saving asks for confirmation."""
+    """Plays the just-recorded clip and offers Save / Discard. The timeline
+    doubles as a QuickTime-style trim bar, so only the kept range is written on
+    save. Closing without saving asks for confirmation."""
 
     def __init__(self, path, on_save, on_discard, suggested_name="recording.mp4",
                  start_dir=None):
@@ -353,27 +752,19 @@ class PreviewWindow:
         if sink is not None:
             self._playbin.set_property("video-sink", sink)
             video = sink.get_property("widget")
-        self._playbin.set_property("uri", "file://" + path)
+        self._playbin.set_property("uri", _uri(path))
         if video is not None:
             box.pack_start(video, True, True, 0)
         else:
             box.pack_start(Gtk.Label(label="(preview unavailable)"), True, True, 0)
 
-        # --- timeline: draggable playhead + elapsed / total ---
+        # --- timeline: playhead + QuickTime-style trim handles ---
         self._duration = 0          # ns, 0 until the demuxer reports it
-        self._seeking = False       # true while the user drags the playhead
+        self._seeking = False       # true while the user drags on the bar
         tl = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         tl.set_margin_start(10); tl.set_margin_end(10); tl.set_margin_top(6)
-        self._seek = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 1, 0.1)
-        self._seek.set_draw_value(False)
-        self._seek.set_hexpand(True)
-        self._seek.set_tooltip_text("Drag to scrub through the recording")
-        # change-value fires for drags, clicks and arrow keys (value-changed would
-        # also fire from our own timer updates and cause a seek feedback loop).
-        self._seek.connect("change-value", self._on_seek)
-        self._seek.connect("button-press-event", self._seek_grab)
-        self._seek.connect("button-release-event", self._seek_release)
-        tl.pack_start(self._seek, True, True, 0)
+        self._bar = _TrimBar(self._bar_seek, self._trim_changed)
+        tl.pack_start(self._bar.widget, True, True, 0)
         self._time_lbl = Gtk.Label(label="0:00 / 0:00")
         self._time_lbl.set_width_chars(12)
         tl.pack_start(self._time_lbl, False, False, 0)
@@ -387,8 +778,17 @@ class PreviewWindow:
         self._play_btn.connect("clicked", self._toggle_play)
         bar.pack_start(self._play_btn, False, False, 0)
         restart = Gtk.Button(label="↺ Restart")
+        restart.set_tooltip_text("Back to the start of the kept range")
         restart.connect("clicked", lambda _b: self._restart())
         bar.pack_start(restart, False, False, 0)
+        self._reset_btn = Gtk.Button(label="Reset trim")
+        self._reset_btn.set_tooltip_text("Keep the whole recording again")
+        self._reset_btn.set_sensitive(False)
+        self._reset_btn.connect("clicked", lambda _b: self._bar.reset())
+        bar.pack_start(self._reset_btn, False, False, 0)
+        self._sel_lbl = Gtk.Label()
+        self._sel_lbl.set_margin_start(4)
+        bar.pack_start(self._sel_lbl, False, False, 0)
         bar.pack_end(self._save_btn(), False, False, 0)
         discard = Gtk.Button(label="Discard")
         discard.get_style_context().add_class("destructive-action")
@@ -414,18 +814,32 @@ class PreviewWindow:
         secs = max(0, int(ns // Gst.SECOND))
         return f"{secs // 60}:{secs % 60:02d}"
 
-    def _seek_grab(self, *_):
-        self._seeking = True
-        return False
+    @staticmethod
+    def _fmt_exact(ns):
+        """Tenths, for the trim readout — whole seconds there would round the two
+        ends and the length independently and read like bad arithmetic."""
+        tenths = max(0, int(round(ns / (Gst.SECOND / 10))))
+        return f"{tenths // 600}:{tenths // 10 % 60:02d}.{tenths % 10}"
 
-    def _seek_release(self, *_):
-        self._seeking = False
-        self._flush_seek()          # land exactly where the drag ended
-        return False
+    def _bar_seek(self, ns, dragging):
+        """The trim bar moved the playhead (scrub, or a handle being dragged)."""
+        self._seeking = dragging
+        self._seek_ns(ns)
+        if not dragging:
+            self._flush_seek()      # land exactly where the drag ended
 
-    def _on_seek(self, _scale, _scroll_type, value):
-        self._seek_ns(int(value * Gst.SECOND))
-        return False          # let GTK move the slider to `value` as usual
+    def _trim_changed(self):
+        """A trim handle was released, or the trim was reset."""
+        b = self._bar
+        self._reset_btn.set_sensitive(b.trimmed)
+        self._sel_lbl.set_markup(
+            f"<small>keeping {self._fmt_exact(b.selection_ns)} "
+            f"({self._fmt_exact(b.start)} – {self._fmt_exact(b.end)})</small>"
+            if b.trimmed else "")
+        self._save_button.set_label("Save trimmed" if b.trimmed else "Save")
+        # Nudge the playhead back inside the kept range if a handle passed it.
+        if not (b.start <= self._position() <= b.end):
+            self._seek_ns(min(max(self._position(), b.start), b.end))
 
     # Coalesce the flood of seeks a drag produces, and ignore reported positions
     # for a moment afterwards so a stale one can't yank the playhead back.
@@ -448,7 +862,7 @@ class PreviewWindow:
         if self._duration:
             pos = max(0, min(self._duration, pos))
         self._seek_target = pos
-        self._seek.set_value(pos / Gst.SECOND)
+        self._bar.set_position(pos)
         self._refresh_time(pos)
         if self._seeking:                       # mid-drag: coalesce
             if self._seek_src is None:
@@ -476,6 +890,11 @@ class PreviewWindow:
     def _refresh_time(self, pos):
         self._time_lbl.set_text(f"{self._fmt(pos)} / {self._fmt(self._duration)}")
 
+    def _position(self):
+        """Best current position: the pending seek target if one is in flight,
+        otherwise where the playhead is drawn."""
+        return self._seek_target if self._seek_target is not None else self._bar.pos
+
     def _poll(self):
         """Keep the playhead and the time label in step with the player."""
         if self._playbin is None:
@@ -484,14 +903,20 @@ class PreviewWindow:
             ok, dur = self._playbin.query_duration(Gst.Format.TIME)
             if ok and dur > 0:
                 self._duration = dur
-                self._seek.set_range(0, dur / Gst.SECOND)
+                self._bar.set_duration(dur)
+                self._refresh_time(0)
         if (self._ended or self._seeking or self._seek_target is not None
                 or time.monotonic() < self._settle_until):
             return True          # parked, dragging, or just sought: hands off
         ok, pos = self._playbin.query_position(Gst.Format.TIME)
         if not ok or pos < 0:
             return True
-        self._seek.set_value(pos / Gst.SECOND)
+        # Playback stays inside the trim: stop at the out-point instead of
+        # running on through material that won't be saved.
+        if self._duration and pos >= self._bar.end:
+            self._park_at_end()
+            return True
+        self._bar.set_position(pos)
         self._refresh_time(pos)
         return True
 
@@ -500,6 +925,12 @@ class PreviewWindow:
         if ev.keyval == Gdk.KEY_space:
             self._toggle_play(None)
             return True
+        if ev.keyval == Gdk.KEY_bracketleft:
+            self._bar.trim_to_playhead("start")
+            return True
+        if ev.keyval == Gdk.KEY_bracketright:
+            self._bar.trim_to_playhead("end")
+            return True
         return False
 
     def _save_btn(self):
@@ -507,6 +938,7 @@ class PreviewWindow:
         b = Gtk.Button(label="Save")
         b.get_style_context().add_class("suggested-action")
         b.connect("clicked", lambda _b: self._save())
+        self._save_button = b
         return b
 
     def _toggle_play(self, _b):
@@ -515,28 +947,32 @@ class PreviewWindow:
             self._playbin.set_state(Gst.State.PAUSED)
             self._play_btn.set_label("▶ Play")
         else:
-            if self._ended:          # parked on the last frame -> play again
-                self._seek_ns(0)
+            if self._ended:          # parked on the out-point -> play again
+                self._seek_ns(self._bar.start)
             self._playbin.set_state(Gst.State.PLAYING)
             self._play_btn.set_label("⏸ Pause")
 
     def _restart(self):
-        self._seek_ns(0)
+        self._seek_ns(self._bar.start)
         self._playbin.set_state(Gst.State.PLAYING)
         self._play_btn.set_label("⏸ Pause")
 
-    def _on_eos(self, *_):
-        """Hold on the last frame at the end of the clip.
+    def _park_at_end(self):
+        """Hold on the out-point instead of running past it or looping.
 
-        It used to seek back to 0 and keep playing, which restarted the
+        It used to seek back to 0 and keep playing at EOS, which restarted the
         recording under you while you were still looking at the end of it.
         """
         self._playbin.set_state(Gst.State.PAUSED)
         self._ended = True
+        end = self._bar.end if self._duration else 0
         if self._duration:
-            self._seek.set_value(self._duration / Gst.SECOND)
-            self._refresh_time(self._duration)
+            self._bar.set_position(end)
+            self._refresh_time(end)
         self._play_btn.set_label("▶ Play")
+
+    def _on_eos(self, *_):
+        self._park_at_end()
 
     def _stop_player(self):
         if self._poll_id is not None:
@@ -575,9 +1011,31 @@ class PreviewWindow:
             return  # cancelled — keep the preview open so they can try again
         if not chosen.lower().endswith(".mp4"):
             chosen += ".mp4"
+        # Release the file before re-encoding it.
         self._stop_player()
+        src = self.path
+        if self._bar.trimmed:
+            out = self.path + ".trim.mp4"
+            prog = _TrimProgress(self.win)
+            try:
+                err = trim_clip(self.path, out, self._bar.start, self._bar.end,
+                                on_progress=prog)
+            finally:
+                prog.destroy()
+            if err is None:
+                src = out
+            else:
+                warn = Gtk.MessageDialog(
+                    transient_for=self.win, modal=True,
+                    message_type=Gtk.MessageType.WARNING,
+                    buttons=Gtk.ButtonsType.OK,
+                    text="Couldn't trim the recording")
+                warn.format_secondary_text(
+                    f"{err}.\n\nThe full, untrimmed recording is being saved "
+                    f"instead — nothing was lost.")
+                warn.run(); warn.destroy()
         self.win.destroy()
-        self._on_save(chosen)
+        self._on_save(chosen, src)
 
     def _discard(self):
         from gi.repository import Gtk
@@ -920,18 +1378,26 @@ class RecordingSession:
             self.error = f"Saved without preview (player error: {exc})"
             self._quit()
 
-    def _save_temp(self, dest):
+    def _save_temp(self, dest, src=None):
+        """`src` is the temp recording, or the trimmed copy of it when the user
+        trimmed in the preview — in which case the original is dropped."""
         import os
         import shutil
+        src = src or self._tmp
         try:
-            os.replace(self._tmp, dest)        # fast path: same filesystem
+            os.replace(src, dest)              # fast path: same filesystem
         except OSError:
             try:
-                shutil.move(self._tmp, dest)   # cross-filesystem (different drive)
+                shutil.move(src, dest)         # cross-filesystem (different drive)
             except OSError:
-                self.saved = self._tmp
+                self.saved = src
                 self.error = f"Could not save to {dest}"
                 return self._quit()
+        if src != self._tmp:
+            try:
+                os.unlink(self._tmp)
+            except OSError:
+                pass
         self.saved = dest
         # Remember the folder for next time.
         try:
