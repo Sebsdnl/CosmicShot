@@ -113,6 +113,25 @@ No-repo options are in [Other ways to install](#other-ways-to-install).
 
 The [APT repository](#install) above is the recommended way. Alternatives:
 
+### Fedora / RPM-based Distributions
+
+CosmicShot includes a `.spec` file to build native RPM packages. You can build and install it using `rpmbuild`:
+
+```bash
+# 1. Install build dependencies
+sudo dnf install -y rpm-build python3-devel python3-pillow
+
+# 2. Prepare the build directory and source tarball
+mkdir -p ~/rpmbuild/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}
+tar -czvf ~/rpmbuild/SOURCES/cosmicshot-1.5.0.tar.gz -C .. CosmicShot
+
+# 3. Build the RPM
+rpmbuild -ba cosmicshot.spec
+
+# 4. Install the generated package
+sudo dnf install -y ~/rpmbuild/RPMS/noarch/cosmicshot-*.noarch.rpm
+```
+
 ### Single `.deb` download
 
 Download the latest `cosmicshot_*.deb` from the
