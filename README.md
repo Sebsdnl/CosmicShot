@@ -115,22 +115,27 @@ The [APT repository](#install) above is the recommended way. Alternatives:
 
 ### Fedora / RPM-based Distributions
 
-CosmicShot includes a `.spec` file to build native RPM packages. You can build and install it using `rpmbuild`:
+Download the latest `cosmicshot-*.noarch.rpm` from the
+[**Releases page**](https://github.com/davidboulay/CosmicShot/releases/latest), then install it:
+
+```bash
+sudo dnf install ./cosmicshot-*.noarch.rpm
+```
+
+<details>
+<summary>Prefer to build the RPM yourself?</summary>
 
 ```bash
 # 1. Install build dependencies
 sudo dnf install -y rpm-build python3-devel python3-pillow
 
-# 2. Prepare the build directory and source tarball
-mkdir -p ~/rpmbuild/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}
-tar -czvf ~/rpmbuild/SOURCES/cosmicshot-1.5.0.tar.gz -C .. CosmicShot
+# 2. Build the RPM using the included script
+./build-rpm.sh
 
-# 3. Build the RPM
-rpmbuild -ba cosmicshot.spec
-
-# 4. Install the generated package
-sudo dnf install -y ~/rpmbuild/RPMS/noarch/cosmicshot-*.noarch.rpm
+# 3. Install the generated package
+sudo dnf install -y dist/cosmicshot-*.noarch.rpm
 ```
+</details>
 
 ### Single `.deb` download
 
