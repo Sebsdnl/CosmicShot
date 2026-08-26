@@ -27,7 +27,7 @@ mkdir -p "$STAGE"/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}
 (cd "$SRC/.." && tar -czf "$STAGE/SOURCES/$PKG-$VER.tar.gz" --exclude=".git" --exclude="dist" "CosmicShot")
 
 # Build RPM
-rpmbuild --define "_topdir $STAGE" -ba "$SRC/cosmicshot.spec" >/dev/null
+rpmbuild --nodeps --define "_topdir $STAGE" -ba "$SRC/cosmicshot.spec" >/dev/null
 
 # Move output to dist/
 mkdir -p "$SRC/dist"
